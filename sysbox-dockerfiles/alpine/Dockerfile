@@ -1,0 +1,5 @@
+#
+# Alpine
+#
+
+FROM alpine:latest

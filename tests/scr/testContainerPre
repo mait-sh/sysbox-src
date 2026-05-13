@@ -1,0 +1,34 @@
+#!/bin/bash
+
+TEST_VOL1=$1
+TEST_VOL2=$2
+TEST_VOL3=$3
+
+# Check that the host meets sysbox-runc distro requirements (this
+# can't be checked from within the test container since its docker
+# image may be based on another distro)
+
+DISTRO=$(cat /etc/os-release | grep "^ID=" | cut -d "=" -f2 | tr -d '"')
+
+if [ "$DISTRO" != "ubuntu" ] &&
+   [ "$DISTRO" != "debian" ] &&
+   [ "$DISTRO" != "centos" ] &&
+   [ "$DISTRO" != "almalinux" ] &&
+   [ "$DISTRO" != "rocky" ] &&
+   [ "$DISTRO" != "fedora" ] &&
+   [ "$DISTRO" != "amzn" ]; then
+    printf "\nWarning: Sysbox is not supported in this distribution (though it may still work): %s.\n\n", $DISTRO
+fi
+
+# Verify that shiftfs is not mounted at host level (some tests assume this is the case)
+mount | grep -q shiftfs
+if [ $? -ne 1 ]; then
+  printf "\nError: detected a shiftfs mount at host level; some sysbox tests assume no shiftfs mounts exist at host level."
+  printf "\nIf you have any shiftfs mounts (e.g., maybe you have a sys container running at host level), remove them please.\n\n"
+  exit 1
+fi
+
+# See Makefile for description of test volumes
+mkdir -p $TEST_VOL1
+mkdir -p $TEST_VOL2
+mkdir -p $TEST_VOL3

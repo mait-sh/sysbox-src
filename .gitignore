@@ -1,0 +1,15 @@
+# Ignore the sysbox build token and build dir
+build
+.buildinfo
+
+# Ignore virtual-studio-code metadata
+.vscode
+
+# Ignore paths holding build artifacts and related files.
+image/deb/debbuild/
+image/deb/sources/
+
+# GNU Global Tags
+GPATH
+GRTAGS
+GTAGS

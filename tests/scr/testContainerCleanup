@@ -1,0 +1,9 @@
+#!/bin/bash
+
+#
+# Test container cleanup script
+#
+rm -rf /var/lib/docker/*
+rm -rf /var/lib/sysbox/*
+rm -rf /var/lib/containers/*
+rm -rf /mnt/scratch/*

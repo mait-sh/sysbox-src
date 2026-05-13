@@ -1,0 +1,61 @@
+package apparmor
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"os"
+
+	"github.com/nestybox/sysbox-runc/internals/pathrs"
+	"github.com/opencontainers/runc/libcontainer/utils"
+	"golang.org/x/sys/unix"
+)
+
+// IsEnabled returns true if apparmor is enabled for the host.
+func IsEnabled() bool {
+	if _, err := os.Stat("/sys/kernel/security/apparmor"); err == nil {
+		buf, err := os.ReadFile("/sys/module/apparmor/parameters/enabled")
+		return err == nil && bytes.HasPrefix(buf, []byte("Y"))
+	}
+	return false
+}
+
+func setProcAttr(attr, value string) error {
+	attr = utils.CleanPath(attr)
+	attrSubPath := "attr/apparmor/" + attr
+	if _, err := os.Stat("/proc/self/" + attrSubPath); errors.Is(err, os.ErrNotExist) {
+		// fall back to the old convention
+		attrSubPath = "attr/" + attr
+	}
+
+	// Under AppArmor you can only change your own attr, so there's no reason
+	// to not use /proc/thread-self/ (instead of /proc/<tid>/, like libapparmor
+	// does).
+	f, closer, err := pathrs.ProcThreadSelfOpen(attrSubPath, unix.O_WRONLY|unix.O_CLOEXEC)
+	if err != nil {
+		return err
+	}
+	defer closer()
+	defer f.Close()
+
+	_, err = f.WriteString(value)
+	return err
+}
+
+// changeOnExec reimplements aa_change_onexec from libapparmor in Go
+func changeOnExec(name string) error {
+	if err := setProcAttr("exec", "exec "+name); err != nil {
+		return fmt.Errorf("apparmor failed to apply profile: %s", err)
+	}
+	return nil
+}
+
+// ApplyProfile will apply the profile with the specified name to the process after
+// the next exec.
+func ApplyProfile(name string) error {
+	if name == "" {
+		return nil
+	}
+
+	return changeOnExec(name)
+}

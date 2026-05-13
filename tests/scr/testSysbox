@@ -1,0 +1,383 @@
+#!/bin/bash -e
+
+#
+# script to run sysbox integration tests
+#
+
+progDir="$(dirname "$0")"
+progName=$(basename "$0")
+
+helpersDir="${progDir}/../helpers/"
+
+source "$helpersDir/uid-shift.bash"
+
+function usage() {
+	printf "\nUsage: $progName [testName]\n"
+	exit 1
+}
+
+function restart_sysbox() {
+	local -n opts=$1
+
+	declare -a base_opt
+	base_opt+=("-t")
+	if [ -n "$DEBUG_ON" ]; then
+		base_opt+=("-d")
+	fi
+
+	sysbox ${base_opt[@]} ${opts[@]}
+}
+
+function run_all_tests() {
+	printf "\nExecuting sysbox-mgr tests ... \n"
+	bats --tap tests/sysmgr
+	printf "\nExecuting sysbox-fs tests ... \n"
+	bats --tap tests/sysfs
+	printf "\nExecuting docker tests ... \n"
+	bats --tap tests/docker
+	printf "\nExecuting cgroup tests ... \n"
+	bats --tap tests/cgroup
+	printf "\nExecuting dind tests ... \n"
+	bats --tap tests/dind
+	printf "\nExecuting cind tests ... \n"
+	bats --tap tests/cind
+	printf "\nExecuting app tests (l1) ... \n"
+	bats --tap tests/apps/l1
+	printf "\nExecuting app tests (l2) ... \n"
+	bats --tap tests/apps/l2
+	printf "\nExecuting multi-arch tests ... \n"
+	bats --tap tests/multi-arch
+	printf "\nExecuting buildx + buildkit tests ... \n"
+	bats --tap tests/buildx
+
+	# Launch syscall interception test-suite.
+	./tests/syscall/syscall.sh
+
+	# Launch kind test-suite.
+	# XXX: tests fail (likely due to old k8s version; need updating). Tracked by issue #929.
+	# printf "\n"
+	# docker system prune -a -f
+	# bats --tap tests/k8s-kind
+
+	# XXX: tests fail (likely due to old k8s version; need updating). Tracked by issue #929.
+	# ./tests/kind/kind.sh
+
+	printf "\nExecuting security tests ... \n"
+	bats --tap tests/security
+
+	printf "\nExecuting perf tests ... \n"
+	bats --tap tests/perf
+
+	# Launch sysbox-pod test-suite.
+	./tests/pods/pods.sh
+
+	printf "\nSysbox health checking ...\n"
+	bats --tap tests/health/sysbox-health.bats
+
+	docker system prune -a -f
+}
+
+function run_ci_tests() {
+	printf "\nExecuting sysbox-mgr tests ... \n"
+	bats --tap tests/sysmgr
+	printf "\nExecuting sysbox-fs tests ... \n"
+	bats --tap tests/sysfs
+	printf "\nExecuting docker tests ... \n"
+	bats --tap tests/docker
+	printf "\nExecuting dind tests ... \n"
+	bats --tap tests/dind
+	printf "\nExecuting app tests (l1) ... \n"
+	bats --tap tests/apps/l1
+	printf "\nExecuting multi-arch tests ... \n"
+	bats --tap tests/multi-arch
+	printf "\nExecuting buildx + buildkit tests ... \n"
+	bats --tap tests/buildx/basic.bats
+	printf "\nExecuting xattr syscall tests ... \n"
+	bats --tap tests/syscall/xattr
+	printf "\nExecuting basic mount syscall-interception tests ... \n"
+	bats --tap tests/syscall/mount/mount.bats
+
+	# Launch kind test-suite.
+	# XXX: tests fail (likely due to old k8s version; need updating). Tracked by issue #929.
+	# printf "\n"
+	# docker system prune -a -f
+	# bats --tap tests/k8s-kind
+	# ./tests/kind/kind.sh tests/kind/kind-custom-net.bats
+
+	# Launch sysbox-pod test-suite.
+	./tests/pods/pods.sh
+
+	printf "\nExecuting security tests ... \n"
+	bats --tap tests/security
+
+	printf "\nSysbox health checking ...\n"
+	bats --tap tests/health/sysbox-health.bats
+
+	docker system prune -a -f
+}
+
+# Test sysbox on when using idmapped-mounts and shiftfs (kernels 5.12+ with a
+# working shiftfs module).
+function test_with_idmapped_and_shiftfs() {
+
+	if ! sysbox_using_idmapped_mnt; then
+		printf "\nNOTE: Skipping idmapped and shiftfs tests (idmapped mount not supported on host)\n"
+		return
+	fi
+
+	if ! sysbox_using_shiftfs; then
+		printf "\nNOTE: Skipping idmapped and shiftfs tests (shiftfs not supported on host)\n"
+		return
+	fi
+
+	printf "\n"
+	printf "Executing Sysbox tests (idmapped + shiftfs)\n"
+	printf -- "-------------------------------------------\n"
+
+	if [ -n "$TEST_SYSBOX_CI" ]; then
+		run_ci_tests
+	else
+		run_all_tests
+	fi
+
+	return 0
+}
+
+# Test sysbox when using idmapped-mounts only (e.g., kernels 5.12+ without
+# shiftfs, or with a non-working shiftfs).
+function test_with_idmapped_only() {
+
+	if ! sysbox_using_idmapped_mnt; then
+		printf "\nNOTE: Skipping idmapped-mount only tests (not supported on host)\n"
+		return
+	fi
+
+	printf "\n"
+	printf "Executing Sysbox tests (idmapped mounts only)\n"
+	printf -- "---------------------------------------------\n"
+
+	printf "\nDisabling Sysbox shiftfs.\n"
+	declare -a sysbox_cmdline
+	sysbox_cmdline+=("--disable-shiftfs")
+	restart_sysbox sysbox_cmdline
+
+	if [ -n "$TEST_SYSBOX_CI" ]; then
+		run_ci_tests
+	else
+		run_all_tests
+	fi
+
+	printf "\nRe-enabling Sysbox shiftfs.\n"
+	sysbox_cmdline=("")
+	restart_sysbox sysbox_cmdline
+
+	return 0
+}
+
+# Test sysbox when using shiftfs only (e.g., Ubuntu with kernel < 5.12).
+# Sysbox will use shiftfs for the rootfs and for the container bind-mounts.
+function test_with_shiftfs_only() {
+
+	if ! sysbox_using_shiftfs; then
+		printf "\nNOTE: Skipping shiftfs only tests (not supported on host)\n"
+		return
+	fi
+
+	printf "\n"
+	printf "Executing Sysbox tests (shiftfs only)\n"
+	printf -- "-------------------------------------\n"
+
+	printf "\nDisabling Sysbox idmapped-mounts.\n"
+	declare -a sysbox_cmdline
+	sysbox_cmdline+=("--disable-idmapped-mount")
+	restart_sysbox sysbox_cmdline
+
+	if [ -n "$TEST_SYSBOX_CI" ]; then
+		run_ci_tests
+	else
+		run_all_tests
+	fi
+
+	printf "\nRe-enabling Sysbox idmapped-mounts.\n"
+	sysbox_cmdline=("")
+	restart_sysbox sysbox_cmdline
+
+	return 0
+}
+
+# Test sysbox when using rootfs cloning / chown; we do this by disabling
+# Sysbox's use of overlayfs on ID-mapped mounts and shiftfs. When both of these
+# are disabled, Sysbox must clone & chown the container's rootfs.
+function test_with_rootfs_cloning() {
+
+	# ID-mapping must still be supported by the kernel (otherwise host mounts
+	# into sysbox containers won't show up with proper ownership)
+	if ! sysbox_using_idmapped_mnt; then
+		printf "\nNOTE: Skipping rootfs cloning tests (ID-mapping not supported on host)\n"
+		return
+	fi
+
+	printf "\n"
+	printf "Executing Sysbox tests (with rootfs cloning) \n"
+	printf -- "---------------------------------------------\n"
+
+	printf "\nDisabling Sysbox shiftfs and overlayfs on ID-mapped mounts.\n"
+
+	declare -a sysbox_cmdline
+	sysbox_cmdline+=("--disable-shiftfs")
+	sysbox_cmdline+=("--disable-ovfs-on-idmapped-mount")
+	restart_sysbox sysbox_cmdline
+
+	if [ -n "$TEST_SYSBOX_CI" ]; then
+		run_ci_tests
+	else
+		run_all_tests
+	fi
+
+	printf "\nRe-enabling Sysbox shiftfs and overlayfs on ID-mapped mounts.\n"
+	sysbox_cmdline=("")
+	restart_sysbox sysbox_cmdline
+
+	return 0
+}
+
+# Test sysbox when Docker is configured with the (legacy) docker image store
+# (default is containerd image store)
+function test_with_docker_image_store() {
+
+	printf "\n"
+	printf "Executing Docker image store + Sysbox tests \n"
+	printf -- "--------------------------------------------------------\n"
+
+	printf "\nConfiguring Docker with the (legacy) image store\n"
+	docker-cfg --containerd-image-store=false
+
+	bats --tap tests/sysmgr
+	bats --tap tests/sysfs
+	bats --tap tests/docker
+	bats --tap tests/dind
+	bats --tap tests/cind
+	bats --tap tests/apps/l1
+	bats --tap tests/buildx
+	./tests/pods/pods.sh
+
+	# Try again with Sysbox using rootfs cloning
+	printf "\nDisabling Sysbox shiftfs and overlayfs on ID-mapped mounts.\n"
+
+	declare -a sysbox_cmdline
+	sysbox_cmdline+=("--disable-shiftfs")
+	sysbox_cmdline+=("--disable-ovfs-on-idmapped-mount")
+	restart_sysbox sysbox_cmdline
+
+	bats --tap tests/sysmgr/rootfsCloning.bats
+	bats --tap tests/docker
+	bats --tap tests/dind
+	bats --tap tests/buildx
+
+	# Cleanup
+	printf "\nRe-enabling Sysbox shiftfs and overlayfs on ID-mapped mounts.\n"
+	sysbox_cmdline=("")
+	restart_sysbox sysbox_cmdline
+
+	printf "\nConfiguring Docker with the default image store\n"
+	docker-cfg --containerd-image-store=true
+}
+
+# Test sysbox when Docker is configured with userns-remap mode.
+function test_with_docker_userns_remap() {
+
+	printf "\n"
+	printf "Executing Sysbox tests (docker-userns-remap)\n"
+	printf -- "--------------------------------------------\n"
+
+	printf "\nConfiguring Docker with userns-remap\n"
+	docker system prune -a -f
+	docker-cfg --userns-remap=enable
+
+	printf "\nExecuting sysbox-mgr tests ... \n"
+	bats --tap tests/sysmgr
+	printf "\nExecuting sysbox-fs tests ... \n"
+	bats --tap tests/sysfs
+	printf "\nExecuting docker tests ... \n"
+	bats --tap tests/docker
+	printf "\nExecuting dind tests ... \n"
+	bats --tap tests/dind
+
+	if [ -z "$TEST_SYSBOX_CI" ]; then
+		printf "\nExecuting cind tests ... \n"
+		bats --tap tests/cind
+
+		# Launch basic kind-flannel test
+		# XXX: tests fail (likely due to old k8s version; need updating). Tracked by issue #929.
+		# docker system prune -a -f
+		# printf "\nExecuting kind testcases with flannel cni ... \n"
+		# bats --tap tests/kind/kind-flannel.bats
+		# docker system prune -a -f
+	fi
+
+	printf "\nExecuting security tests ... \n"
+	bats --tap tests/security
+
+	printf "\nSysbox health checking ...\n"
+	bats --tap tests/health/sysbox-health.bats
+
+	docker system prune -a -f
+
+	sleep 5
+
+	printf "\nReverting Docker userns-remap config\n"
+	docker-cfg --userns-remap=disable
+}
+
+# These tests reconfigure and restart Sysbox; they must execute after all other
+# tests to prevent the reconfig from affecting the "--disable-idmapped-mount"
+# and "--disable-shiftfs" options used by the other sections of this test
+# script.
+function test_sysbox_config() {
+	printf "\n"
+	printf "Executing sysbox config tests\n"
+	printf -- "-----------------------------\n"
+	bats --tap tests/config
+}
+
+function test_sysbox_lifecycle() {
+	printf "\n"
+	printf "\nExecuting life-cycle tests ... \n"
+	printf -- "--------------------------------\n"
+	bats --tap tests/lifecycle
+}
+
+function main() {
+
+	# argument testName is optional; if present, only that test is executed.
+	if [ $# -eq 1 ]; then
+		printf "\nExecuting $1 ... \n"
+		bats --tap $1
+	else
+
+		if [ -n "$TEST_SYSBOX_CI" ]; then
+			printf "\n"
+			printf "********************************************\n"
+			printf "Executing Sysbox tests (CI) ... \n"
+			printf "********************************************\n"
+		else
+			printf "\n"
+			printf "********************************************\n"
+			printf "Executing Sysbox tests (ALL) ... \n"
+			printf "********************************************\n"
+		fi
+
+		test_with_idmapped_and_shiftfs
+		test_with_idmapped_only
+		test_with_shiftfs_only
+		test_with_rootfs_cloning
+		test_with_docker_image_store
+		# Skip docker userns-remap + sysbox tests (will deprecate feature as it has little use and is redundant with Sysbox)
+		#test_with_docker_userns_remap
+		test_sysbox_config
+		test_sysbox_lifecycle
+
+	fi
+}
+
+main "$@"

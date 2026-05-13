@@ -1,0 +1,167 @@
+#!/bin/bash
+
+# sysbox integration test setup helpers
+#
+# Note: based on a similar file in the OCI runc integration tests
+#
+# Note: these should not use bats, so as to allow their use
+# when manually reproducing tests.
+
+# Container registry for test container images
+#
+# NOTE: we use the GitHub Container Registry (ghcr.io); in the past we used the
+# Docker registry but we don't do this since late 2020 because it's rate-limited
+# on anonymous downloads.
+export CTR_IMG_REPO="ghcr.io/nestybox"
+
+# Note: work-dir must not be on tmpfs; otherwise the sys container
+# fails to launch with "permission-denied" when not using uid-shifting
+# (not sure why, probably related to the tmpfs mount uid(gid)
+# setting).
+WORK_DIR="/mnt/scratch/work"
+mkdir -p $WORK_DIR
+
+INTEGRATION_ROOT=$(dirname "$(readlink -f "$BASH_SOURCE")")
+SYSBOX_ROOT="${INTEGRATION_ROOT}/../../"
+RECVTTY="${INTEGRATION_ROOT}/../../sysbox-runc/contrib/cmd/recvtty/recvtty"
+BUNDLES="${INTEGRATION_ROOT}/../bundles"
+
+CONSOLE_SOCKET="$WORK_DIR/console.sock"
+
+BUSYBOX_TAR_GZ="$BUNDLES/busybox_${TARGET_ARCH}.tar.gz"
+BUSYBOX_BUNDLE="$WORK_DIR/busyboxtest"
+
+DEBIAN_TAR_GZ="$BUNDLES/debian_${TARGET_ARCH}.tar.gz"
+DEBIAN_BUNDLE="$WORK_DIR/debiantest"
+
+# Root state path.
+ROOT=$(mktemp -d "$WORK_DIR/runc.XXXXXX")
+
+RUNC=sysbox-runc
+
+RUNC_FLAGS="--no-kernel-check"
+
+# sys container uid(gid) mapping
+UID_MAP=100000
+GID_MAP=100000
+ID_MAP_SIZE=65536
+
+SYSCONT_NAME=""
+
+# Retry a command $1 times until it succeeds. Wait $2 seconds between retries.
+# (copied from runc/tests/integration/helpers.bash)
+function retry() {
+  local attempts=$1
+  shift
+  local delay=$1
+  shift
+  local i
+
+  for ((i = 0; i < attempts; i++)); do
+    $@
+    if [ "$?" -eq 0 ]; then
+		 return 0
+    fi
+    sleep $delay
+  done
+
+  echo "Command \"$@\" failed $attempts times. Output: $?"
+  false
+}
+
+# Wrapper for sysbox-runc
+function __sv_runc() {
+  command $RUNC ${RUNC_FLAGS} --log /proc/self/fd/2 --root "$ROOT" "$@"
+}
+
+# Wrapper for sysbox-runc spec, which takes only one argument (the bundle path).
+function runc_spec() {
+  ! [[ "$#" > 1 ]]
+
+  local args=()
+  local bundle=""
+
+  if [ "$#" -ne 0 ]; then
+    bundle="$1"
+    args+=("--bundle" "$bundle")
+  fi
+
+  $RUNC spec "${args[@]}"
+}
+
+function setup_recvtty() {
+  # We need to start recvtty in the background, so we double fork in the shell.
+  ("$RECVTTY" --pid-file "$WORK_DIR/recvtty.pid" --mode null "$CONSOLE_SOCKET" &) &
+}
+
+function teardown_recvtty() {
+  # When we kill recvtty, the container will also be killed.
+  if [ -f "$WORK_DIR/recvtty.pid" ]; then
+    kill -9 $(cat "$WORK_DIR/recvtty.pid")
+  fi
+
+  # Clean up the files that might be left over.
+  rm -f "$WORK_DIR/recvtty.pid"
+  rm -f "$CONSOLE_SOCKET"
+}
+
+function teardown_running_container() {
+  res=$(__sv_runc list)
+  # $1 should be a container name such as "test_busybox"
+  # here we detect "test_busybox "(with one extra blank) to avoid conflict prefix
+  # e.g. "test_busybox" and "test_busybox_update"
+  if [[ "${res}" == *"$1 "* ]]; then
+    __sv_runc kill $1 KILL
+    retry 10 1 eval "__sv_runc state '$1' | grep -q 'stopped'"
+    __sv_runc delete $1
+  fi
+}
+
+# setup_bundle tar-gz-path setup-path
+function setup_bundle() {
+  local tar_gz=$1
+  local bundle=$2
+
+  setup_recvtty
+  mkdir -p "$bundle"/rootfs
+
+  tar --exclude './dev/*' -C "$bundle"/rootfs -xzf "$tar_gz"
+
+  # Set bundle ownership and restrict search access to it, to ensure Sysbox
+  # can deal with this.
+  chown -R root:root "$bundle"
+  chmod 700 "$bundle"
+
+  cd "$bundle"
+  runc_spec
+}
+
+# teardown_bundle bundle_path container_name
+function teardown_bundle() {
+  local bundle="$1"
+  local container="$2"
+  cd "$INTEGRATION_ROOT"
+  teardown_running_container "$container"
+  teardown_recvtty
+  rm -f -r "$bundle"
+}
+
+function setup_busybox() {
+  setup_bundle "$BUSYBOX_TAR_GZ" "$BUSYBOX_BUNDLE"
+}
+
+# teardown_busybox container_name
+function teardown_busybox() {
+  local container="$1"
+  teardown_bundle "$BUSYBOX_BUNDLE" "$container"
+}
+
+function setup_debian() {
+  setup_bundle "$DEBIAN_TAR_GZ" "$DEBIAN_BUNDLE"
+}
+
+# teardown_debian container_name
+function teardown_debian() {
+  local container="$1"
+  teardown_bundle "$DEBIAN_BUNDLE" "$container"
+}

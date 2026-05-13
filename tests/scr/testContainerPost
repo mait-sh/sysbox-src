@@ -1,0 +1,9 @@
+#!/bin/bash
+
+TEST_VOL1=$1
+TEST_VOL2=$2
+TEST_VOL3=$3
+
+rm -rf $TEST_VOL1
+rm -rf $TEST_VOL2
+rm -rf $TEST_VOL3

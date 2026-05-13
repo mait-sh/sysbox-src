@@ -1,0 +1,349 @@
+#!/bin/bash
+
+#
+# Test container initialization script
+#
+
+# Dockerd default configuration dir/file.
+dockerCfgDir="/etc/docker"
+dockerCfgFile="${dockerCfgDir}/daemon.json"
+
+# Default mtu value associated to test-container's egress-interface.
+default_mtu=1500
+
+# Retries the given command a given number of attempts, each after a given delay
+# (e.g., retry 10 1 <command>)
+function retry() {
+	local attempts=$1
+	shift
+	local delay=$1
+	shift
+	local i
+
+	for ((i = 0; i < attempts; i++)); do
+		$@ > /dev/null 2>&1
+		if [ "$?" -eq 0 ]; then
+			return 0
+		fi
+		sleep $delay
+	done
+
+	echo "Command \"$@\" failed $attempts times. Output: $?"
+	return 1
+}
+
+#
+# Obtain the MTU value to be configured for the docker interface within the test
+# container. This value shall be the lowest among these ...
+#
+#  * The 'physical' default-gateway interface at host level (L0).
+#  * The 'logical' default-gateway interface connecting the test-container (L1) with the host.
+#  * The 'default' mtu value (1500 bytes) supported by most NICs.
+#
+function docker_iface_mtu() {
+
+	local egress_iface
+	local l0_egress_mtu
+	local l1_egress_mtu
+
+	# Identify default egress iface.
+	local egress_iface=$(ip route show | awk '/default via/ {print $5}')
+	if [ -z "${egress_iface}" ]; then
+		return
+	fi
+
+	# Obtain mtu value associated to the test-container's egress interface.
+	egress_mtu=$(ip link show ${egress_iface} | awk '/mtu / {print $5}')
+	if [ ! -z "${egress_mtu}" ] &&
+		[ "${egress_mtu}" -lt "${default_mtu}" ]; then
+		l1_egress_mtu=${egress_mtu}
+	else
+		l1_egress_mtu=${default_mtu}
+	fi
+
+	# Pull L0 egress-mtu value passed from Sysbox's makefile.
+	l0_egress_mtu=${PHY_EGRESS_IFACE_MTU}
+
+	if [ "${l0_egress_mtu}" -lt "${l1_egress_mtu}" ]; then
+		echo ${l0_egress_mtu}
+	else
+		echo ${l1_egress_mtu}
+	fi
+}
+
+# Adjust the test container's Docker mtu configuration. This is required to
+# avoid forwarding issues in containers seating behind an egress-interface with
+# lower-than-default mtu.
+function docker_config_mtu() {
+	egress_mtu=$(docker_iface_mtu)
+	if [ ! -z "${egress_mtu}" ] && [ "${egress_mtu}" -ne "${default_mtu}" ]; then
+		jq --arg mtu "${egress_mtu}" --indent 4 '. + {"mtu": $mtu|tonumber}' "${dockerCfgFile}" \
+			>${tmpfile} && cp ${tmpfile} "${dockerCfgFile}"
+	fi
+}
+
+function cleanup_docker_env() {
+	docker_conts=$(docker ps -aq)
+	if [[ "$docker_conts" != "" ]]; then
+		ret=$(docker stop -t0 $(docker ps -aq))
+	fi
+
+	docker_conts=$(docker ps -aq)
+	if [[ "$docker_conts" != "" ]]; then
+		ret=$(docker rm -f $(docker ps -aq))
+	fi
+
+	ret=$(docker volume prune -f)
+	if [[ $? -ne 0 ]]; then
+		echo "Failed to remove Docker volumes: $ret"
+		exit 1
+	fi
+
+	ret=$(docker network prune -f)
+	if [[ $? -ne 0 ]]; then
+		echo "Failed to remove Docker networks: $ret"
+		exit 1
+	fi
+}
+
+function crio_config() {
+
+	# Create default crio config file
+	crio config > /etc/crio/crio.conf 2>/dev/null
+	cp /etc/crio/crio.conf /etc/crio/crio.conf.orig
+
+	# Add Sysbox to CRI-O's list of runtimes
+	ret=$(dasel put object -f /etc/crio/crio.conf -p toml -t string -t string -t string "crio.runtime.runtimes.sysbox-runc" \
+		"runtime_path=/usr/bin/sysbox-runc" "runtime_type=oci" "monitor_path=/usr/libexec/crio/conmon")
+	if [[ $? -ne 0 ]]; then
+		echo "Failed to configure CRI-O: $ret"
+		exit 1
+	fi
+
+	ret=$(dasel put string -f /etc/crio/crio.conf -p toml "crio.runtime.runtimes.sysbox-runc.allowed_annotations.[0]" \
+		"io.kubernetes.cri-o.userns-mode")
+	if [[ $? -ne 0 ]]; then
+		echo "Failed to configure CRI-O: $ret"
+		exit 1
+	fi
+
+	# Configure CRI-O storage driver (overlayfs)
+	ret=$(dasel put string -f /etc/crio/crio.conf -p toml -m 'crio.storage_driver' "overlay")
+	if [[ $? -ne 0 ]]; then
+		echo "Failed to configure CRI-O: $ret"
+		exit 1
+	fi
+
+	ret=$(dasel put string -f /etc/crio/crio.conf -p toml -m 'crio.storage_option.[]' "overlay.mountopt=metacopy=on")
+	if [[ $? -ne 0 ]]; then
+		echo "Failed to configure CRI-O: $ret"
+		exit 1
+	fi
+
+	# If we are not using systemd, configure CRI-O with the cgroupfs driver
+	if ! systemd_env; then
+		ret=$(dasel put string -f /etc/crio/crio.conf -p toml "crio.runtime.cgroup_manager" "cgroupfs")
+		if [[ $? -ne 0 ]]; then
+			echo "Failed to configure CRI-O: $ret"
+			exit 1
+		fi
+
+		ret=$(dasel put string -f /etc/crio/crio.conf -p toml "crio.runtime.conmon_cgroup" "pod")
+		if [[ $? -ne 0 ]]; then
+			echo "Failed to configure CRI-O: $ret"
+			exit 1
+		fi
+	fi
+
+	# Configure crictl to use CRI-O
+	ret=$(dasel put string -f /etc/crictl.yaml -p yaml -m '.runtime-endpoint' "unix:///var/run/crio/crio.sock")
+	if [[ $? -ne 0 ]]; then
+		echo "Failed to configure crictl: $ret"
+		exit 1
+	fi
+
+	ret=$(dasel put string -f /etc/crictl.yaml -p yaml -m '.image-endpoint' "unix:///var/run/crio/crio.sock")
+	if [[ $? -ne 0 ]]; then
+		echo "Failed to configure crictl: $ret"
+		exit 1
+	fi
+
+	# Add user "containers" to /etc/sub[u,g]id (needed by the containers/storage
+	# lib used by CRI-O) Note: range was chosen manually to not conflict with
+	# sysbox's range and allow for up to 32 containers of 65536 IDs each.
+	grep "containers" /etc/subuid
+	if [ $? -eq 1 ]; then
+		echo "containers:2147483648:2097152" >>/etc/subuid
+	fi
+	grep "containers" /etc/subgid
+	if [ $? -eq 1 ]; then
+		echo "containers:2147483648:2097152" >>/etc/subgid
+	fi
+
+	# Disable ipv6 (to avoid "failed to set bridge addr: could not add IP address to "cni0": permission denied")
+	ret=$(sysctl net.ipv6.conf.default.disable_ipv6=0)
+	ret=$(sysctl net.ipv6.conf.all.disable_ipv6=0)
+}
+
+function systemd_env() {
+	ret=$(readlink /proc/1/exe)
+	if [[ "$ret" =~ "/lib/systemd/systemd" ]]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+function systemd_running() {
+	ps -ef | egrep systemd | wc -l | egrep [4-9]+
+}
+
+function wait_systemd_ready() {
+	retry 15 1 systemd_running
+}
+
+function wait_docker_ready() {
+	retry 10 1 docker ps
+}
+
+function install_sysbox_pkg() {
+	if [ ! -f ${SB_PACKAGE_FILE} ]; then
+		echo "Did not find sysbox installer: file ${SB_PACKAGE_FILE} does not exist"
+		exit 1
+	fi
+
+	# These quirks are required for apt-get to work correctly inside the test container
+	rm -rf /usr/sbin/policy-rc.d
+	dpkg -i dummy > /dev/null 2>&1 || true
+	apt-get update
+
+	# Install sysbox; the --reinstall flag ensures the test container need not be
+	# cleaned up between executions of the testContainerInit script.
+	echo "Installing ${SB_PACKAGE} package at ${SB_PACKAGE_FILE}"
+	apt-get install --reinstall -y --no-install-recommends "${PWD}/${SB_PACKAGE_FILE}"
+}
+
+function build_sysbox() {
+
+	# TODO: Support testing other architecures with qemu?
+	thisHost=$(hostname)-${TARGET_ARCH}
+
+	# Build cookie (to build from scratch when necessary only)
+	if [[ ! -f .buildinfo ]]; then
+		touch .buildinfo
+		chown rootless:rootless .buildinfo
+	fi
+
+	lastBuildHost=$(cat .buildinfo)
+	if [[ "$lastBuildHost" != "$thisHost" ]]; then
+		make clean
+		echo "$thisHost" > .buildinfo
+	fi
+
+	if [ -n "${DEBUG_ON}" ]; then
+		echo "Building sysbox for debugging purposes (unstripped binaries & compiler optimizations off)..."
+		make sysbox-debug-local --no-print-directory && make install
+	else
+		echo "Building sysbox ..."
+		make sysbox-static-local --no-print-directory && make install
+	fi
+}
+
+# Returns linux distro running in the system.
+function get_host_distro() {
+	local distro=$(cat /etc/os-release | awk -F"=" '/^ID=/ {print $2}' | tr -d '"')
+	echo $distro
+}
+
+function main() {
+
+	if systemd_env; then
+		echo "Waiting for systemd to be ready ..."
+		wait_systemd_ready
+	fi
+
+	# Temp file for jq write operations
+	tmpfile=$(mktemp /tmp/init-scr.XXXXXX)
+	trap 'rm -f "${tmpfile}"' EXIT
+
+	# Install helper scripts
+	install -D -m0755 scr/sysbox /usr/bin/sysbox
+	install -D -m0755 scr/docker-cfg /usr/bin/docker-cfg
+	install -D -m0755 tests/scr/sysbox-docker-cp /usr/bin/sysbox-docker-cp
+
+	# In debian systems (apt-based ones) ensure that the basic dir/file layout
+	# is in place right from the start.
+	mkdir -p /var/lib/dpkg/{alternatives,info,parts,triggers,updates} && touch /var/lib/dpkg/status
+
+	# Install sysbox
+	if [[ "$SB_INSTALLER" == "true" ]]; then
+		install_sysbox_pkg
+	else
+		build_sysbox
+	fi
+
+	# Start docker (without systemd, we must start Docker manually)
+	export DOCKER_BUILDKIT_RUNC_COMMAND=/usr/bin/sysbox-runc
+	if ! systemd_env; then
+		echo "Starting Docker ..."
+		dockerd=$(which dockerd)
+		$dockerd >/var/log/dockerd.log 2>&1 &
+	fi
+
+	echo "Waiting for Docker to be ready ..."
+	wait_docker_ready || exit 1
+
+	# Start Sysbox.
+	if [ -n "$DEBUG_ON" ]; then
+		echo "Starting sysbox in debug mode ..."
+		sysbox -d -t
+		[ $? -eq 0 ] || exit 1
+	else
+		echo "Starting sysbox in test mode ..."
+		sysbox -t
+		[ $? -eq 0 ] || exit 1
+	fi
+
+	# Configure Docker to use Sysbox (leveraging the docker-cfg script)
+	common_opt="--config-only --sysbox-runtime=enable --default-runtime=sysbox-runc --containerd-image-store=true"
+
+	docker-cfg -v $common_opt
+	[ $? -eq 0 ] || exit 1
+
+	# Configure the Docker networks to avoid overlap with host networking.
+	# Note: the chosen IP addresses will likely not overlap with the host Docker networks
+	# (even when Sysbox is installed at host level) or with inner container Docker networks.
+	docker-cfg -v --config-only --bip=172.21.0.1/16 --default-address-pool=172.81.0.0/16
+	[ $? -eq 0 ] || exit 1
+
+	docker_config_mtu
+
+	# Restart Docker to pickup the new configs
+	docker-cfg --force-restart
+	[ $? -eq 0 ] || exit 1
+
+	echo "Removing left-over Docker containers, volumes, and networks ..."
+	cleanup_docker_env
+
+	# Configure & initialize CRI-O in scenarios that support Sysbox-POD feature (currently
+	# only in Ubuntu and Debian distros).
+	local distro=$(get_host_distro)
+	if [[ "${distro}" = "ubuntu" ]] || [[ "${distro}" = "debian" ]]; then
+		crio_config
+
+		# Start CRI-O (without systemd, we must start CRI-O manually)
+		if systemd_env; then
+			systemctl restart crio
+		else
+			crio > /var/log/crio.log 2>&1 &
+		fi
+	fi
+
+	if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+		$PWD/tests/scr/testContainerCgv2Fix >/dev/null 2>&1 &
+	fi
+
+	echo "Test container ready ..."
+}
+
+main "$@"

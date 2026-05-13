@@ -1,0 +1,548 @@
+#!/bin/bash -e
+
+#
+# Script to configure & start (or restart) Sysbox.
+#
+# If Sysbox is running as a systemd service, this script reconfigures the
+# systemd unit and restarts the service. Otherwise, this script starts the
+# Sysbox components (e.g. sysbox-mgr, sysbox-fs) by executing their binaries
+# (which are assumed to be installed on the host in the /usr/bin/ directory).
+#
+# Type "sudo ./sysbox --help". for usage info.
+
+PROGNAME=$(basename $0)
+VERBOSE=1
+TEST_MODE=0
+DEBUG_MODE=0
+NO_SHIFTFS=0
+NO_SHIFTFS_ON_FUSE=0
+NO_SHIFTFS_PRECHECK=0
+NO_IDMAPPED_MOUNT=0
+NO_OVFS_ON_IDMAPPED_MOUNT=0
+NO_ROOTFS_CLONING=0
+NO_INNER_IMG_PRELOAD=0
+IGNORE_SYSFS_CHOWN=0
+HONOR_CAPS=0
+SYSCONT_MODE="true"
+ALLOW_TRUSTED_XATTR=0
+SET_DATA_ROOT=0
+SET_SECCOMP_FD_REL=0
+FSUID_MAP_FAIL_ON_ERR=0
+ALLOW_IMMUTABLE_UNMOUNTS="true"
+ALLOW_IMMUTABLE_REMOUNTS="false"
+RELAXED_READ_ONLY=0
+
+# Max number of user-namespaces to configure in distros supporting this knob.
+SYSBOX_MAX_USER_NS=10000
+
+# Systemd related variables
+SYSTEMD_LIB_DIR="/lib/systemd/system"
+
+# Retry a command $1 times until it succeeds. Wait $2 seconds between retries.
+# (copied from runc/tests/integration/helpers.bash)
+function retry() {
+	local attempts=$1
+	shift
+	local delay=$1
+	shift
+	local i
+
+	for ((i = 0; i < attempts; i++)); do
+		$@
+		if [ "$?" -eq 0 ]; then
+			return 0
+		fi
+		sleep $delay
+	done
+
+	echo "Command \"$@\" failed $attempts times. Output: $?"
+	false
+}
+
+# Ensure that kernel-modules expected by system-level apps (running within sys
+# containers) are properly loaded.
+function load_required_modules() {
+	if ! modprobe ip_tables &> /dev/null && ! iptables -L &> /dev/null ; then
+		echo "Could not load ip_tables kernel module. Exiting ..."
+		return 1
+	fi
+
+	return 0
+}
+
+# Returns linux distro running in the system.
+function get_host_distro() {
+	local distro=$(cat /etc/os-release | awk -F"=" '/^ID=/ {print $2}' | tr -d '"')
+	echo $distro
+}
+
+# Returns linux kernel version in the system.
+function get_kernel_version() {
+	echo $(uname -r)
+}
+
+# Ensures user "sysbox" is present on the host
+function setup_sysbox_user() {
+   local exit_code=0
+   grep -q "^sysbox:" /etc/passwd || exit_code=$?
+   if (( $exit_code == 1 )); then
+      useradd -r -s /usr/sbin/nologin sysbox
+   fi
+}
+
+function check_distro_support() {
+	local distro=$1
+
+	if [[ "${distro}" != "ubuntu" ]] &&
+			[[ "${distro}" != "debian" ]] &&
+			[[ "${distro}" != "centos" ]] &&
+			[[ "${distro}" != "almalinux" ]] &&
+			[[ "${distro}" != "rocky" ]] &&
+			[[ "${distro}" != "fedora" ]] &&
+			[[ "${distro}" != "amzn" ]]; then
+      echo "Unsupported Linux distribution: $distro. Sysbox may not operate as expected."
+	fi
+}
+
+# Ensures unprivileged user-ns's are allowed.
+function setup_userns() {
+	local distro=$1
+	local kver=$2
+
+	local out=$(echo "$kver" | grep -q "WSL")
+	local isWSL=$?
+
+	if [ $isWSL -ne 0 ]; then
+		if [[ "${distro}" == "ubuntu" ]] ||[[ "${distro}" == "debian" ]]; then
+			if [ -f "/proc/sys/kernel/unprivileged_userns_clone" ]; then
+				echo "1" > /proc/sys/kernel/unprivileged_userns_clone
+			fi
+		fi
+	fi
+
+   # Setting user-ns max value.
+   max_user_ns=$(</proc/sys/user/max_user_namespaces)
+   if [[ $max_user_ns =~ ^[0-9]+$ ]] && [[ $max_user_ns -lt $SYSBOX_MAX_USER_NS ]]; then
+		echo $SYSBOX_MAX_USER_NS > /proc/sys/user/max_user_namespaces
+   fi
+}
+
+# Identifies kernel-header's expected path based on distro.
+function kernel_header_path() {
+
+	local distro=$1
+	local path
+
+	if [[ "${distro}" == "centos" ]] ||
+			[[ "${distro}" == "fedora" ]] ||
+			[[ "${distro}" == "almalinux" ]] ||
+			[[ "${distro}" == "rocky" ]] ||
+			[[ "${distro}" == "redhat" ]] ||
+			[[ "${distro}" == "amzn" ]]; then
+      path="/usr/src/kernels/$(uname -r)"
+	else
+      path="/usr/src/linux-headers-$(uname -r)"
+	fi
+
+	echo "$path"
+}
+
+# Verifies that a kernel configuration file is found, and if that's not the case,
+# copy it from the original "/boot" folder. Notice that this may not work when
+# running sysbox within a test-priv container, as "/boot" folder may not be around;
+# in those cases initialization will proceed as normal and a log will be dumped to
+# alert the user.
+function setup_kernel_config() {
+
+	local distro=$1
+
+	local kernel_path=$(kernel_header_path $distro)
+
+	if [[ ! -f "${kernel_path}"/.config ]]; then
+      # Attempt to find kernel config in /boot path.
+      if [[ -d /boot ]] && [[ -f /boot/config-$(uname -r) ]]; then
+			cp /boot/config-$(uname -r) "${kernel_path}"/.config
+			return
+      fi
+
+      echo -e "\nUnable to find a kernel config file. This may affect some system" \
+			  "level apps running within sys-containers. As a solution, identify your" \
+			  "kernel config file in the host (typically: \"/boot/config-$(uname -r)\")" \
+			  "and copy it into your distro's expected kernel-headers path" \
+			  "(usually: \"$(kernel_header_path $distro)\").\n"
+	fi
+}
+
+# Increases system-level resources to satisfy Sysbox requirements.
+function setup_maxs() {
+
+	# Increase default inotify resources to meet sys container's demands.
+	sysctl -w fs.inotify.max_queued_events=1048576 &> /dev/null
+	sysctl -w fs.inotify.max_user_watches=1048576 &> /dev/null
+	sysctl -w fs.inotify.max_user_instances=1048576 &> /dev/null
+
+	# Increase default keyring resources to meet sys container demands.
+	# For a k8s cluster:
+	# keys = 35 + (workers * 23) + (2 * pods)
+	# maxbytes = 20 bytes * maxkeys
+	sysctl -w kernel.keys.maxkeys=20000 &> /dev/null
+	sysctl -w kernel.keys.maxbytes=$((20*20000)) &> /dev/null
+}
+
+# Completes Sysbox's setup process.
+function sysbox_setup() {
+
+	local distro=$(get_host_distro)
+	local kver=$(get_kernel_version)
+
+	check_distro_support "$distro"
+
+	if ! load_required_modules; then
+      exit 1
+	fi
+
+	setup_sysbox_user
+	setup_userns "$distro" "$kver"
+	setup_kernel_config "$distro"
+	setup_maxs
+}
+
+# Stop all Sysbox components.
+function sysbox_stop() {
+
+	sysmgr_pids=$(pidof sysbox-mgr) || true
+	sysfs_pids=$(pidof sysbox-fs) || true
+
+	for pid in $sysmgr_pids; do
+		[[ $VERBOSE ]] && printf "Stopping sysbox-mgr\n"
+		kill $pid
+	done
+
+	for pid in $sysfs_pids; do
+		[[ $VERBOSE ]] && printf "Stopping sysbox-fs\n"
+		kill $pid
+	done
+
+	sleep 2
+}
+
+function sysbox_mgr_set_cmdline_opts() {
+	local varname=$1
+
+	if [ $DEBUG_MODE -eq 1 ]; then
+		eval "$varname+=(\"--log-level=debug\")"
+	fi
+
+	if [ $NO_SHIFTFS -eq 1 ]; then
+		eval "$varname+=(\"--disable-shiftfs\")"
+	fi
+
+	if [ $NO_SHIFTFS_ON_FUSE -eq 1 ]; then
+		eval "$varname+=(\"--disable-shiftfs-on-fuse\")"
+	fi
+
+	if [ $NO_SHIFTFS_PRECHECK -eq 1 ]; then
+		eval "$varname+=(\"--disable-shiftfs-precheck\")"
+	fi
+
+	if [ $NO_IDMAPPED_MOUNT -eq 1 ]; then
+		eval "$varname+=(\"--disable-idmapped-mount\")"
+	fi
+
+	if [ $NO_OVFS_ON_IDMAPPED_MOUNT -eq 1 ]; then
+		eval "$varname+=(\"--disable-ovfs-on-idmapped-mount\")"
+	fi
+
+	if [ $NO_ROOTFS_CLONING -eq 1 ]; then
+		eval "$varname+=(\"--disable-rootfs-cloning\")"
+	fi
+
+	if [ $NO_INNER_IMG_PRELOAD -eq 1 ]; then
+		eval "$varname+=(\"--disable-inner-image-preload\")"
+	fi
+
+	if [ $IGNORE_SYSFS_CHOWN -eq 1 ]; then
+		eval "$varname+=(\"--ignore-sysfs-chown\")"
+	fi
+
+	if [ $HONOR_CAPS -eq 1 ]; then
+		eval "$varname+=(\"--honor-caps\")"
+	fi
+
+	if [ $SYSCONT_MODE == "false" ]; then
+		eval "$varname+=(\"--syscont-mode=false\")"
+	fi
+
+	if [[ $ALLOW_TRUSTED_XATTR -eq 1 ]]; then
+		eval "$varname+=(\"--allow-trusted-xattr\")"
+	fi
+
+	if [ $SET_DATA_ROOT -eq 1 ]; then
+		eval "$varname+=(\"--data-root ${DATA_ROOT}\")"
+	fi
+
+	if [ $FSUID_MAP_FAIL_ON_ERR -eq 1 ]; then
+		eval "$varname+=(\"--fsuid-map-fail-on-error\")"
+	fi
+
+	if [ $RELAXED_READ_ONLY -eq 1 ]; then
+		eval "$varname+=(\"--relaxed-read-only\")"
+	fi
+
+	eval "$varname+=(\"--log /var/log/sysbox-mgr.log\")"
+}
+
+function sysbox_mgr_start() {
+
+	[[ $VERBOSE ]] && printf "Starting sysbox-mgr\n"
+
+	declare -a mgr_options
+	sysbox_mgr_set_cmdline_opts mgr_options
+
+	sysbox-mgr ${mgr_options[@]} &
+	sleep 1
+
+	res=$(retry 10 1 grep -q Ready /var/log/sysbox-mgr.log)
+	if [ $? -ne 0 ]; then
+		printf "\nsysbox-mgr failed to start. Here is the log file:\n"
+		cat /var/log/sysbox-mgr.log
+		exit 1
+	fi
+}
+
+function sysbox_fs_set_cmdline_opts() {
+	local varname=$1
+
+	if [ $DEBUG_MODE -eq 1 ]; then
+		eval "$varname+=(\"--log-level=debug\")"
+	fi
+
+	if [ $TEST_MODE -eq 1 ]; then
+		eval "$varname+=(\"--ignore-handler-errors\")"
+	fi
+
+	if [ $SET_SECCOMP_FD_REL -eq 1 ]; then
+		eval "$varname+=(\"--seccomp-fd-release=${SECCOMP_FD_REL}\")"
+	fi
+
+	if [ $ALLOW_IMMUTABLE_UNMOUNTS == "false" ]; then
+		eval "$varname+=(\"--allow-immutable-unmounts=false\")"
+	fi
+
+	if [ $ALLOW_IMMUTABLE_REMOUNTS == "true" ]; then
+		eval "$varname+=(\"--allow-immutable-remounts=true\")"
+	fi
+
+	eval "$varname+=(\"--log /var/log/sysbox-fs.log\")"
+}
+
+function sysbox_fs_start() {
+
+	[[ $VERBOSE ]] && printf "Starting sysbox-fs\n"
+
+	declare -a fs_options
+	sysbox_fs_set_cmdline_opts fs_options
+
+	sysbox-fs ${fs_options[@]} &
+	sleep 1
+
+	res=$(retry 10 1 grep -q Ready /var/log/sysbox-fs.log)
+	if [ $? -ne 0 ]; then
+		printf "\nsysbox-fs failed to start. Here is the log file:\n"
+		cat /var/log/sysbox-fs.log
+		exit 1
+	fi
+}
+
+function sysbox_start() {
+	# Note: sysbox-runc is started by the higher level container manager (e.g.,
+	# Docker, containerd)
+	sysbox_mgr_start
+	sysbox_fs_start
+}
+
+function systemd_service_detected() {
+	if [ -f "${SYSTEMD_LIB_DIR}/sysbox.service" ]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+function systemd_sysfs_config() {
+	declare -a fs_options
+	sysbox_fs_set_cmdline_opts fs_options
+	local opt_str=${fs_options[@]}
+	sed -i "s|ExecStart=.*|ExecStart=/usr/bin/sysbox-fs $opt_str|g" ${SYSTEMD_LIB_DIR}/sysbox-fs.service
+}
+
+function systemd_sysmgr_config() {
+	declare -a mgr_options
+	sysbox_mgr_set_cmdline_opts mgr_options
+	local opt_str=${mgr_options[@]}
+	sed -i "s|ExecStart=.*|ExecStart=/usr/bin/sysbox-mgr $opt_str|g" ${SYSTEMD_LIB_DIR}/sysbox-mgr.service
+}
+
+function systemd_config() {
+	systemd_sysfs_config
+	systemd_sysmgr_config
+}
+
+function systemd_restart() {
+	systemctl daemon-reload
+	systemctl restart sysbox.service
+}
+
+function show_usage() {
+	printf "\n"
+	printf "Usage: $PROGNAME [OPTIONS]\n"
+	printf "\n"
+	printf "Configures and starts (or restarts) Sysbox. Meant for Sysbox testing.\n"
+	printf "If Sysbox is running as a systemd service, this script reconfigures the\n"
+	printf "systemd unit and restarts the service. Otherwise, this script starts the\n"
+	printf "Sysbox components (e.g. sysbox-mgr, sysbox-fs) by executing their binaries\n"
+	printf "(which are assumed to be installed on the host in the /usr/bin/ directory).\n"
+	printf "\n"
+	printf "Options:\n"
+	printf "  -t, --test-mode                       Configures Sysbox in test mode (for use in the Sysbox test suite only).\n"
+	printf "  -d, --debug                           Enables debug logging in Sysbox (useful for debugging).\n"
+	printf "      --data-root <dir>                 Path to Sysbox data store (defaults to /var/lib/sysbox).\n"
+	printf "      --disable-shiftfs                 Disables Sysbox's use of shiftfs (defaut = false).\n"
+	printf "      --disable-shiftfs-on-fuse         Disables shiftfs on top of FUSE-based filesystems; FUSE-backed files mounted into the Sysbox container may show with nobody:nogroup ownership inside the container. (default = false).\n"
+	printf "      --disable-shiftfs-precheck        Disables Sysbox's preflight functional check of shiftfs; use this only if you want Sysbox to use shiftfs (e.g., kernel < 5.12) and you know it works properly (default = false).\n"
+	printf "      --disable-idmapped-mount          Disables Sysbox's use of ID-mapped mounts (default = false).\n"
+	printf "      --disable-ovfs-on-idmapped-mount  Disables Sysbox's use of overlayfs on ID-mapped mounts (default = false).\n"
+	printf "      --disable-rootfs-cloning          Disables rootfs cloning on hosts without shiftfs; setting this option will significantly slow down container startup time (default = false).\n"
+	printf "      --disable-inner-image-preload     Disables the Sysbox feature that allows users to preload inner container images into system container images (e.g., via Docker commit or build); this makes container stop faster; running system container images that come preloaded with inner container images continue to work fine; (default = false).\n"
+	printf "      --ignore-sysfs-chown              Ignore chown of /sys inside all Sysbox containers; may be needed to run a few apps that chown /sys inside the container (e.g,. rpm). Causes Sysbox to trap the chown syscall inside the container, slowing it down (default = false).\n"
+	printf "      --allow-trusted-xattr             Allows the overlayfs trusted.overlay.opaque xattr to be set inside all Sysbox containers; needed when running Docker inside Sysbox on hosts with kernel < 5.11. Causes Sysbox to trap the *xattr syscalls inside the container, slowing it down (default = false).\n"
+	printf "      --honor-caps                      Honor the container's process capabilities passed to Sysbox by the higher level container manager (e.g., Docker/containerd). When set to false (default), Sysbox always gives the container's root user full capabilities and other users no capabilities to mimic a VM-like environment. Note that the container's capabilities are isolated from the host via the Linux user-namespace. (default = false).\n"
+	printf "      --syscont-mode                    Causes Sysbox to run in \"system container\" mode. In this mode, it sets up the container to run system workloads (e.g., systemd, Docker, Kubernetes, etc.) seamlessly and securely. When set to false, Sysbox operates in \"regular container\" mode where it sets up the container per its OCI spec (usually for microservices), with the exception of the Linux 'user' and 'cgroup' namespaces which Sysbox always enables for extra container isolation. (default = true)\n"
+	printf "      --relaxed-read-only               Allows Sysbox to create read-only containers while enabling read-write operations in certain mountpoints within the container. (default = false)\n",
+	printf "      --seccomp-fd-release <pol>        Policy to close syscall interception handles; useful in kernels < 5.8; allowed values are \"proc-exit\" and \"cont-exit\" (default = \"proc-exit\")\n"
+	printf "      --fsuid-map-fail-on-error         When set to true, fail to launch a container whenever filesystem uid-mapping (needed for files to show proper ownership inside the container's user-namespace) hits an error; when set to false, launch the container anyway (files may show up owned by nobody:nogroup) (default = false)\n"
+	printf "      --allow-immutable-remounts <val>  A container's initial mounts are considered immutable by Sysbox; this option allows them to be remounted from within the container (default: \"false\")\n"
+	printf "      --allow-immutable-unmounts <val>  A container's initial mounts are considered immutable by Sysbox; this option allows them to be unmounted from within the container (default: \"true\")\n"
+	printf "  -h, --help                            Display usage.\n"
+	printf "\n"
+}
+
+function parse_args() {
+	options=$(getopt -o tdh -l test-mode,debug,disable-shiftfs,disable-shiftfs-on-fuse,disable-shiftfs-precheck,disable-idmapped-mount,disable-ovfs-on-idmapped-mount,disable-rootfs-cloning,disable-inner-image-preload,ignore-sysfs-chown,honor-caps,syscont-mode:,relaxed-read-only,allow-trusted-xattr,data-root:,seccomp-fd-release:,fsuid-map-fail-on-error,allow-immutable-remounts:,allow-immutable-unmounts:,help -- "$@")
+	eval set -- "$options"
+
+	while true; do
+		case "$1" in
+			-h | --help)
+				show_usage
+				exit 1
+				;;
+			-t | --test-mode)
+				TEST_MODE=1
+				;;
+			-d | --debug)
+				DEBUG_MODE=1
+				;;
+			--disable-shiftfs)
+				NO_SHIFTFS=1
+				;;
+			--disable-shiftfs-on-fuse)
+				NO_SHIFTFS_ON_FUSE=1
+				;;
+			--disable-shiftfs-precheck)
+				NO_SHIFTFS_PRECHECK=1
+				;;
+			--disable-idmapped-mount)
+				NO_IDMAPPED_MOUNT=1
+				;;
+			--disable-ovfs-on-idmapped-mount)
+				NO_OVFS_ON_IDMAPPED_MOUNT=1
+				;;
+			--disable-rootfs-cloning)
+				NO_ROOTFS_CLONING=1
+				;;
+			--disable-inner-image-preload)
+				NO_INNER_IMG_PRELOAD=1
+				;;
+			--ignore-sysfs-chown)
+				IGNORE_SYSFS_CHOWN=1
+				;;
+			--honor-caps)
+				HONOR_CAPS=1
+				;;
+			--syscont-mode)
+				shift
+				SYSCONT_MODE=$1
+				;;
+			--allow-trusted-xattr)
+				ALLOW_TRUSTED_XATTR=1
+				;;
+			--data-root)
+				SET_DATA_ROOT=1
+				shift
+				DATA_ROOT=$1
+				;;
+			--seccomp-fd-release)
+				SET_SECCOMP_FD_REL=1
+				shift
+				SECCOMP_FD_REL=$1
+				;;
+			--fsuid-map-fail-on-error)
+				FSUID_MAP_FAIL_ON_ERR=1
+				;;
+			--allow-immutable-unmounts)
+				shift
+				ALLOW_IMMUTABLE_UNMOUNTS=$1
+				;;
+			--allow-immutable-remounts)
+				shift
+				ALLOW_IMMUTABLE_REMOUNTS=$1
+				;;
+			--relaxed-read-only)
+				RELAXED_READ_ONLY=1
+				;;
+			--)
+				shift
+				break
+				;;
+			-*)
+				show_usage
+				exit 1
+				;;
+			*)
+				show_usage
+				exit 1
+				;;
+		esac
+		shift
+	done
+
+	[[ "$1" == "" ]] || {
+		show_usage
+		exit 1
+	}
+
+}
+
+function main() {
+
+	parse_args "$@"
+
+	if [ "$EUID" -ne 0 ]; then
+		echo "Please run as root."
+		exit
+	fi
+
+	if systemd_service_detected; then
+		systemd_config
+		systemd_restart
+	else
+		sysbox_stop
+		sysbox_setup
+		sysbox_start
+	fi
+
+	[[ $VERBOSE ]] && printf "Done.\n"
+}
+
+main "$@"

@@ -1,0 +1,20 @@
+{
+    "metadata": {
+        "name": "alpine"
+    },
+    "image":{
+        "image": "ghcr.io/nestybox/alpine"
+    },
+    "command": [
+        "tail", "-f", "/dev/null"
+    ],
+    "log_path":"alpine.log",
+    "mounts": [
+        {
+            "container_path": "/mnt/test",
+            "host_path": "/mnt/scratch/test"
+        }
+    ],
+    "linux": {
+    }
+}
