@@ -88,7 +88,12 @@ type containerInfo struct {
 	rootfsOnOvfs           bool
 	rootfsOvfsUpper        string
 	rootfsOvfsUpperChowned bool
-	rmWatchPath            string // the path to watch to detect container removal
+	// overlayfsUpperIDMap records whether this container's overlayfs upper layer
+	// was set up with MOUNT_ATTR_IDMAP rather than ShiftIdsWithChown. When true,
+	// no chown is needed on pause/resume because the idmap layer handles uid
+	// translation transparently.
+	overlayfsUpperIDMap bool
+	rmWatchPath         string // the path to watch to detect container removal
 }
 
 type mgrConfig struct {
@@ -97,16 +102,21 @@ type mgrConfig struct {
 	shiftfsOnOverlayfsOk    bool
 	idMapMountOk            bool
 	overlayfsOnIDMapMountOk bool
-	noRootfsCloning         bool
-	ignoreSysfsChown        bool
-	allowTrustedXattr       bool
-	honorCaps               bool
-	syscontMode             bool
-	fsuidMapFailOnErr       bool
-	noInnerImgPreload       bool
-	noShiftfsOnFuse         bool
-	relaxedReadOnly         bool
-	mountBinfmtMisc         bool
+	// overlayfsUpperIDMap indicates the kernel supports id-mapping the overlayfs
+	// upperdir and workdir (requires Linux >= 5.19 and a functional probe).
+	// When true, sysbox-runc id-maps the upper layer instead of chown'ing it,
+	// fixing the "docker cp" nobody:nogroup bug.
+	overlayfsUpperIDMap bool
+	noRootfsCloning     bool
+	ignoreSysfsChown    bool
+	allowTrustedXattr   bool
+	honorCaps           bool
+	syscontMode         bool
+	fsuidMapFailOnErr   bool
+	noInnerImgPreload   bool
+	noShiftfsOnFuse     bool
+	relaxedReadOnly     bool
+	mountBinfmtMisc     bool
 }
 
 type SysboxMgr struct {
@@ -250,9 +260,10 @@ func newSysboxMgr(ctx *cli.Context) (*SysboxMgr, error) {
 
 	idMapMountOk := false
 	ovfsOnIDMapMountOk := false
+	ovfsUpperIDMapOk := false
 
 	if !ctx.GlobalBool("disable-idmapped-mount") {
-		idMapMountOk, ovfsOnIDMapMountOk, err = checkIDMapMountSupport(ctx)
+		idMapMountOk, ovfsOnIDMapMountOk, ovfsUpperIDMapOk, err = checkIDMapMountSupport(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("ID-mapping check failed: %v", err)
 		}
@@ -260,6 +271,7 @@ func newSysboxMgr(ctx *cli.Context) (*SysboxMgr, error) {
 
 	if ctx.GlobalBool("disable-ovfs-on-idmapped-mount") {
 		ovfsOnIDMapMountOk = false
+		ovfsUpperIDMapOk = false
 	}
 
 	shiftfsModPresent := false
@@ -318,6 +330,7 @@ func newSysboxMgr(ctx *cli.Context) (*SysboxMgr, error) {
 		shiftfsOnOverlayfsOk:    shiftfsOnOvfsOk,
 		idMapMountOk:            idMapMountOk,
 		overlayfsOnIDMapMountOk: ovfsOnIDMapMountOk,
+		overlayfsUpperIDMap:     ovfsUpperIDMapOk,
 		noRootfsCloning:         ctx.GlobalBool("disable-rootfs-cloning"),
 		ignoreSysfsChown:        ctx.GlobalBool("ignore-sysfs-chown"),
 		allowTrustedXattr:       ctx.GlobalBool("allow-trusted-xattr"),
@@ -354,6 +367,7 @@ func newSysboxMgr(ctx *cli.Context) (*SysboxMgr, error) {
 		logrus.Info("Use of overlayfs on ID-mapped mounts disabled.")
 	} else {
 		logrus.Infof("Overlayfs on ID-mapped mounts supported by kernel: %s", ifThenElse(mgrCfg.overlayfsOnIDMapMountOk, "yes", "no"))
+		logrus.Infof("Overlayfs upperdir ID-mapped mounts supported by kernel: %s", ifThenElse(mgrCfg.overlayfsUpperIDMap, "yes", "no"))
 	}
 
 	if mgrCfg.noRootfsCloning {
@@ -542,12 +556,13 @@ func (mgr *SysboxMgr) register(regInfo *ipcLib.RegistrationInfo) (*ipcLib.Contai
 		}
 
 		info = containerInfo{
-			state:        started,
-			mntPrepRev:   []mntPrepRevInfo{},
-			shiftfsMarks: []shiftfs.MountPoint{},
-			rootfs:       rootfs,
-			rmWatchPath:  rmWatchPath,
-			rootfsOnOvfs: rootfsOnOvfs,
+			state:               started,
+			mntPrepRev:          []mntPrepRevInfo{},
+			shiftfsMarks:        []shiftfs.MountPoint{},
+			rootfs:              rootfs,
+			rmWatchPath:         rmWatchPath,
+			rootfsOnOvfs:        rootfsOnOvfs,
+			overlayfsUpperIDMap: mgr.mgrCfg.overlayfsUpperIDMap,
 		}
 
 	} else {
@@ -625,6 +640,7 @@ func (mgr *SysboxMgr) register(regInfo *ipcLib.RegistrationInfo) (*ipcLib.Contai
 		ShiftfsOnOverlayfsOk:    mgr.mgrCfg.shiftfsOnOverlayfsOk,
 		IDMapMountOk:            mgr.mgrCfg.idMapMountOk,
 		OverlayfsOnIDMapMountOk: mgr.mgrCfg.overlayfsOnIDMapMountOk,
+		OverlayfsUpperIDMap:     mgr.mgrCfg.overlayfsUpperIDMap,
 		NoRootfsCloning:         mgr.mgrCfg.noRootfsCloning,
 		IgnoreSysfsChown:        mgr.mgrCfg.ignoreSysfsChown,
 		AllowTrustedXattr:       mgr.mgrCfg.allowTrustedXattr,
@@ -661,11 +677,11 @@ func (mgr *SysboxMgr) update(updateInfo *ipcLib.UpdateInfo) error {
 			formatter.ContainerID{id})
 	}
 
-	// If the container's rootfs is on overlayfs and it's ID-mapped, then
-	// sysbox-runc will chown the upper layer as it can't be ID-mapped (overlayfs
-	// does not support it). Track this fact so we can revert that chown when
-	// the container is stopped or paused.
-	if info.rootfsOnOvfs && rootfsUidShiftType == idShiftUtils.IDMappedMount {
+	// If the container's rootfs is on overlayfs and ID-mapped, track whether
+	// the upper layer was chowned so we can revert that chown when the container
+	// is stopped or paused. When overlayfsUpperIDMap is active the upper layer
+	// is id-mapped instead of chowned, so no tracking or revert is needed.
+	if info.rootfsOnOvfs && rootfsUidShiftType == idShiftUtils.IDMappedMount && !info.overlayfsUpperIDMap {
 		rootfsOvfsUpper, err := getRootfsOverlayUpperLayer(info.rootfs)
 		if err != nil {
 			return nil
@@ -734,10 +750,12 @@ func (mgr *SysboxMgr) unregister(id string) error {
 		info.shiftfsMarks = []shiftfs.MountPoint{}
 	}
 
-	// If the rootfs is ID-mapped and on overlayfs, then chown the upper dir from
-	// [userns-host-ID -> 0] when the container stops (i.e., revert uid:gid to
-	// it's original). This way snapshots of the container rootfs (e.g., docker
-	// commit or docker build) will capture the correct uid:gid.
+	// If the rootfs is ID-mapped and on overlayfs under the chown strategy, revert
+	// the upper dir uid:gid shift when the container stops (i.e., chown from
+	// [userns-host-ID -> 0]). This ensures snapshots (e.g., docker commit) capture
+	// the correct uid:gid. When overlayfsUpperIDMap is active, rootfsOvfsUpperChowned
+	// is always false, so this block is skipped — no revert is needed because the
+	// idmap layer does not alter on-disk uids.
 	//
 	// TODO: before checking for info.autoRemove, we should ensure that the
 	// autoRemoveCheck() goroutine has run to completion. Otherwise the
@@ -1446,10 +1464,12 @@ func (mgr *SysboxMgr) pause(id string) error {
 			formatter.ContainerID{id})
 	}
 
-	// If the rootfs is ID-mapped and on overlayfs, then chown the upper dir from
+	// If the rootfs is ID-mapped and on overlayfs, chown the upper dir from
 	// [userns-host-ID -> 0] when the container pauses (same as we do during
 	// unregister(); see comment there for more info).
-
+	// When overlayfsUpperIDMap is active, rootfsOvfsUpperChowned is always false
+	// (set in update()), so this block is skipped — no chown is needed because
+	// the idmap layer handles uid translation on every access.
 	if info.rootfsOvfsUpperChowned {
 		uidOffset := -int32(info.uidMappings[0].HostID)
 		gidOffset := -int32(info.gidMappings[0].HostID)
@@ -1500,12 +1520,14 @@ func (mgr *SysboxMgr) resume(id string) error {
 	uidOffset := int32(info.uidMappings[0].HostID)
 	gidOffset := int32(info.gidMappings[0].HostID)
 
-	// If the rootfs is ID-mapped and on overlayfs, then chown the upper dir from
+	// If the rootfs is ID-mapped and on overlayfs, chown the upper dir from
 	// [0 -> userns-host-ID] when the container resumes (i.e., opposite of what
 	// we do in pause()).
-
+	// Skip entirely when overlayfsUpperIDMap is active: the idmap layer already
+	// translates every access through the upper directory, so re-chowning would
+	// double-shift on-disk uids and corrupt ownership.
 	if info.rootfsUidShiftType == idShiftUtils.IDMappedMount &&
-		info.rootfsOnOvfs {
+		info.rootfsOnOvfs && !info.overlayfsUpperIDMap {
 
 		// chown the rootfs upper dir (same as we do during update()).
 		logrus.Infof("resume %s: chown rootfs overlayfs upper layer at %s (%d -> %d)",
