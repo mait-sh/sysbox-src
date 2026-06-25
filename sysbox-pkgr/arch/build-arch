@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# In-container build helper for the sysbox-ce Arch package.
+# Parallel to deb/build-deb and rpm/build-rpm.
+#
+# Runs as the unprivileged `build` user (makepkg refuses root). Syncs the
+# upstream sysbox VERSION into the PKGBUILD's pkgver field, then invokes
+# makepkg. Artefacts are copied to /build (the orchestrator bind-mount
+# target), mirroring the deb/rpm conventions.
+#
+
+set -x
+set -e
+
+cd /home/build/build-arch
+
+# Extract sysbox VERSION so we can keep pkgver in sync with the upstream
+# tree without manual edits. The actual extraction the PKGBUILD performs
+# happens later inside prepare() — we just peek at VERSION here.
+mkdir -p /tmp/sysbox-peek
+tar -xzf sysbox.tgz -C /tmp/sysbox-peek sysbox/VERSION
+UPSTREAM_VERSION=$(cat /tmp/sysbox-peek/sysbox/VERSION)
+PKG_VERSION=$(awk -F= '/^pkgver=/ {print $2}' PKGBUILD)
+
+if [ "${UPSTREAM_VERSION}" != "${PKG_VERSION}" ]; then
+    echo "WARN PKGBUILD pkgver (${PKG_VERSION}) != sysbox/VERSION (${UPSTREAM_VERSION}); patching for this build"
+    sed -i "s/^pkgver=.*/pkgver=${UPSTREAM_VERSION}/" PKGBUILD
+fi
+
+# Build the package. `-L` keeps a per-step log under ./*.log for
+# debuggability. `--noconfirm` because the build container has passwordless
+# sudo and no interactive TTY.
+makepkg --noconfirm -L --skipinteg
+
+# Copy artefacts out to the orchestrator bind-mount target.
+sudo mkdir -p /build
+sudo cp -v sysbox-ce-*.pkg.tar.zst /build/
+sudo cp -v *.log /build/ 2>/dev/null || true
+sudo chown -R "$(id -u):$(id -g)" /build || true

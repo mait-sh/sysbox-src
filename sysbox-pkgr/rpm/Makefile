@@ -9,16 +9,29 @@
 	fedora       \
 	fedora-31    \
 	fedora-32    \
+	fedora-42    \
 	clean
 
 SHELL:=/bin/bash
-ARCH:=$(shell uname -m)
 
-# Go version to utilize in slave containers for the building process.
-# We are temporarily skipping these settings as we are relying on Go's
-# top-of-tree (till 1.13 comes out).
+# Obtain the current system architecture (deb-style abbreviation).
+# Mirrors deb/Makefile so artefact paths line up with the existing pipeline.
+UNAME_M := $(shell uname -m)
+ifeq ($(UNAME_M),x86_64)
+	ARCH := amd64
+else ifeq ($(UNAME_M),aarch64)
+	ARCH := arm64
+else
+	ARCH := $(UNAME_M)
+endif
+
+# Go version to utilize in build containers.
+# Bumped from 1.13 → 1.22 to satisfy sysbox 0.7.0's requirements (matches
+# deb/Makefile's GO_VERSION). The legacy fedora-31 / fedora-32 / centos-8
+# targets are left in place but are not maintained — only `fedora-42`
+# has a working Dockerfile under this directory.
 GO_BASE_IMAGE=golang
-GO_VERSION:=1.13
+GO_VERSION:=1.22
 GO_IMAGE=$(GO_BASE_IMAGE):$(GO_VERSION)
 
 # Sysbox source-code locations.
@@ -46,15 +59,16 @@ SOURCES=$(addprefix sources/, $(SOURCE_FILES))
 CHOWN:=docker run --rm -v $(CURDIR):/v -w /v alpine chown
 
 DOCKER_BUILD=docker build                                  \
-	--build-arg GO_IMAGE=$(GO_IMAGE)                   \
-	--build-arg COMMON_FILES=$(SYSBOX_IMAGE_COMMON)    \
-	-t rpmbuild-$@/$(ARCH)                             \
+	--build-arg GO_IMAGE=$(GO_IMAGE)                       \
+	--build-arg arch=$(ARCH)                               \
+	--build-arg COMMON_FILES=$(SYSBOX_IMAGE_COMMON)        \
+	-t rpmbuild-$@/$(ARCH)                                 \
 	-f $(CURDIR)/$@/Dockerfile .
 
 DOCKER_RUN=docker run --rm -i                    \
-	-e EDITION                               \
-	-v $(CURDIR)/rpmbuild/$@:/build          \
-	-v $(GOPATH)/pkg/mod:/go/pkg/mod         \
+	-e EDITION                                   \
+	-v $(CURDIR)/rpmbuild/$@:/build              \
+	-v $(GOPATH)/pkg/mod:/go/pkg/mod             \
 	rpmbuild-$@/$(ARCH)
 
 
@@ -79,16 +93,23 @@ centos-8: $(SOURCES)
 	$(CHOWN) -R $(shell id -u):$(shell id -g) rpmbuild/$@
 
 fedora: ## Build Fedora packages
-fedora: fedora-31 fedora-32
+fedora: fedora-42
 
-fedora-31: ## Build Fedora-31 package
+fedora-31: ## (legacy, no Dockerfile — kept for back-compat only)
 fedora-31: $(SOURCES)
 	$(DOCKER_BUILD)
 	$(DOCKER_RUN)
 	$(CHOWN) -R $(shell id -u):$(shell id -g) rpmbuild/$@
 
-fedora-32: ## Build Fedora-32 packages
+fedora-32: ## (legacy, no Dockerfile — kept for back-compat only)
 fedora-32: $(SOURCES)
+	$(DOCKER_BUILD)
+	$(DOCKER_RUN)
+	$(CHOWN) -R $(shell id -u):$(shell id -g) rpmbuild/$@
+
+fedora-42: ## Build Fedora-42 RPM package
+fedora-42: $(SOURCES)
+	@echo "== Building RPM package for $@ =="
 	$(DOCKER_BUILD)
 	$(DOCKER_RUN)
 	$(CHOWN) -R $(shell id -u):$(shell id -g) rpmbuild/$@

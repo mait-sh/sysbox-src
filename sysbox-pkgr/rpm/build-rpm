@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+#
+# In-container build helper for the sysbox-ce RPM.
+# Parallel to deb/build-deb: extracts sysbox source, syncs VERSION from
+# the upstream tree into the spec (no manual edits required), and runs
+# rpmbuild. Artefacts are copied to /build (the orchestrator bind-mount
+# target).
+#
+
+set -x
+set -e
+
+cd /root/rpmbuild
+
+# Extract sysbox source so %prep has the tarball available at the path the
+# spec expects (it's already in SOURCES/ via the Dockerfile COPY; rpmbuild
+# will untar it during %prep itself).
+
+# Pick up upstream version directly out of the sysbox tree to keep the
+# spec's `Version:` in sync without manual editing. We extract just VERSION
+# to a tmp path for inspection — rpmbuild does the real extract in %prep.
+tar -xzf SOURCES/sysbox.tgz -C /tmp sysbox/VERSION
+UPSTREAM_VERSION=$(cat /tmp/sysbox/VERSION)
+SPEC_VERSION=$(awk '/^Version:/ {print $2}' SPECS/sysbox-ce.spec)
+
+if [ "${UPSTREAM_VERSION}" != "${SPEC_VERSION}" ]; then
+    echo "WARN spec Version (${SPEC_VERSION}) != sysbox/VERSION (${UPSTREAM_VERSION}); patching spec for this build"
+    sed -i "s/^Version:.*/Version:        ${UPSTREAM_VERSION}/" SPECS/sysbox-ce.spec
+fi
+
+# Build both binary RPM and SRPM (for traceability).
+rpmbuild -ba \
+    --define "_topdir /root/rpmbuild" \
+    --define "_tmppath /root/rpmbuild/tmp" \
+    SPECS/sysbox-ce.spec
+
+# Copy artefacts to the bind-mounted /build directory (the orchestrator
+# Makefile expects sysbox-ce*.rpm here, mirroring the deb pipeline's layout).
+mkdir -p /build
+cp -v /root/rpmbuild/RPMS/*/sysbox-ce-*.rpm /build/
+cp -v /root/rpmbuild/SRPMS/sysbox-ce-*.src.rpm /build/ || true
