@@ -63,6 +63,7 @@ SOURCES=$(addprefix sources/, $(SOURCE_FILES))
 CHOWN:=docker run --rm -v $(CURDIR):/v -w /v alpine chown
 
 DOCKER_BUILD=docker build                              \
+	--platform linux/$(ARCH)                           \
 	--build-arg GO_IMAGE=$(GO_IMAGE)                   \
 	--build-arg arch=$(ARCH)                           \
 	--build-arg DEB_FILES=sysbox-${EDITION}            \
@@ -70,6 +71,7 @@ DOCKER_BUILD=docker build                              \
 	-f $(CURDIR)/$@/Dockerfile .
 
 DOCKER_RUN=docker run --privileged --rm -i    \
+	--platform linux/$(ARCH)                  \
 	-e EDITION                                \
 	-v $(CURDIR)/build/$(ARCH)/$@:/build      \
 	-v $(GOPATH)/pkg/mod:/go/pkg/mod          \
@@ -80,6 +82,7 @@ DOCKER_RUN=docker run --privileged --rm -i    \
 	build-$@/$(ARCH)
 
 DOCKER_BUILD_RELEASE=docker build                                \
+	--platform linux/$(ARCH)                                     \
 	--build-arg GO_IMAGE=$(GO_IMAGE)                             \
 	--build-arg arch=$(ARCH)                                     \
 	--build-arg DEB_FILES=sysbox-${EDITION}                      \
@@ -87,6 +90,7 @@ DOCKER_BUILD_RELEASE=docker build                                \
 	-f $(CURDIR)/$(RELEASE_BASELINE_IMAGE)/Dockerfile .
 
 DOCKER_RUN_RELEASE=docker run --privileged --rm -i               \
+	--platform linux/$(ARCH)                                     \
 	-e EDITION                                                   \
 	-v $(CURDIR)/build/$(ARCH)/$(RELEASE_BASELINE_IMAGE):/build  \
 	-v $(GOPATH)/pkg/mod:/go/pkg/mod                             \
