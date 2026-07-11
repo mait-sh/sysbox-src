@@ -11,6 +11,7 @@
 	ubuntu-bionic      \
 	ubuntu-focal       \
 	ubuntu-jammy       \
+	ubuntu-noble       \
 	clean
 
 SHELL:=/bin/bash
@@ -31,7 +32,7 @@ endif
 # that this is currently a requirement to build official Sysbox
 # packages as only Impish (or later) carries ID-mapped mount support
 # in the kernel and associated clibs.
-RELEASE_BASELINE_IMAGE=ubuntu-jammy
+RELEASE_BASELINE_IMAGE=ubuntu-noble
 
 # Go version to utilize in building process.
 GO_BASE_IMAGE=golang
@@ -63,6 +64,7 @@ SOURCES=$(addprefix sources/, $(SOURCE_FILES))
 CHOWN:=docker run --rm -v $(CURDIR):/v -w /v alpine chown
 
 DOCKER_BUILD=docker build                              \
+	--platform linux/$(ARCH)                           \
 	--build-arg GO_IMAGE=$(GO_IMAGE)                   \
 	--build-arg arch=$(ARCH)                           \
 	--build-arg DEB_FILES=sysbox-${EDITION}            \
@@ -70,6 +72,7 @@ DOCKER_BUILD=docker build                              \
 	-f $(CURDIR)/$@/Dockerfile .
 
 DOCKER_RUN=docker run --privileged --rm -i    \
+	--platform linux/$(ARCH)                  \
 	-e EDITION                                \
 	-v $(CURDIR)/build/$(ARCH)/$@:/build      \
 	-v $(GOPATH)/pkg/mod:/go/pkg/mod          \
@@ -80,6 +83,7 @@ DOCKER_RUN=docker run --privileged --rm -i    \
 	build-$@/$(ARCH)
 
 DOCKER_BUILD_RELEASE=docker build                                \
+	--platform linux/$(ARCH)                                     \
 	--build-arg GO_IMAGE=$(GO_IMAGE)                             \
 	--build-arg arch=$(ARCH)                                     \
 	--build-arg DEB_FILES=sysbox-${EDITION}                      \
@@ -87,6 +91,7 @@ DOCKER_BUILD_RELEASE=docker build                                \
 	-f $(CURDIR)/$(RELEASE_BASELINE_IMAGE)/Dockerfile .
 
 DOCKER_RUN_RELEASE=docker run --privileged --rm -i               \
+	--platform linux/$(ARCH)                                     \
 	-e EDITION                                                   \
 	-v $(CURDIR)/build/$(ARCH)/$(RELEASE_BASELINE_IMAGE):/build  \
 	-v $(GOPATH)/pkg/mod:/go/pkg/mod                             \
@@ -127,7 +132,7 @@ debian-bullseye: $(SOURCES)
 	$(CHOWN) -R $(shell id -u):$(shell id -g) build/$(ARCH)/$@
 
 ubuntu: ## Build Ubuntu packages
-ubuntu: ubuntu-bionic ubuntu-focal ubuntu-jammy
+ubuntu: ubuntu-bionic ubuntu-focal ubuntu-jammy ubuntu-noble
 
 ubuntu-bionic: ## Build Ubuntu Bionic package
 ubuntu-bionic: $(SOURCES)
@@ -145,6 +150,13 @@ ubuntu-focal: $(SOURCES)
 
 ubuntu-jammy: ## Build Ubuntu Jammy package
 ubuntu-jammy: $(SOURCES)
+	@echo "== Building packages for $@ =="
+	$(DOCKER_BUILD)
+	$(DOCKER_RUN)
+	$(CHOWN) -R $(shell id -u):$(shell id -g) build/$(ARCH)/$@
+
+ubuntu-noble: ## Build Ubuntu Noble package
+ubuntu-noble: $(SOURCES)
 	@echo "== Building packages for $@ =="
 	$(DOCKER_BUILD)
 	$(DOCKER_RUN)
