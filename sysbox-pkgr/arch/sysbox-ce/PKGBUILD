@@ -1,0 +1,152 @@
+# Maintainer: Downstream rebuild
+#
+# sysbox-ce — Sysbox Community Edition (downstream rebuild, Arch port).
+#
+# This PKGBUILD mirrors the Debian packaging at
+# `modules/sysbox/sysbox-pkgr/deb/sysbox-ce/` and the RPM spec at
+# `modules/sysbox/sysbox-pkgr/rpm/sysbox-ce/sysbox-ce.spec`.
+#
+# This package is NOT submitted to the AUR.
+
+pkgname=sysbox-ce
+pkgver=0.7.0
+# pkgrel left at 1 because Arch has no equivalent of the rpm `~rebuild1`
+# release sentinel; this is a downstream rebuild, not submitted to the AUR.
+pkgrel=1
+pkgdesc="Sysbox Community Edition — secure container runtime (downstream rebuild)"
+arch=('x86_64')
+url='https://github.com/nestybox/sysbox'
+license=('Apache')
+
+# Runtime depends — mirrors deb/sysbox-ce/control Depends:, translated to
+# Arch package names.
+#   - fuse3: sysbox-fs shells out to `fusermount3` (NOT `fusermount`) to
+#     mount its FUSE server into the container's user-namespaced /sys and
+#     /proc trees. Arch's `fuse2` ships only `/usr/bin/fusermount`; `fuse3`
+#     ships `/usr/bin/fusermount3`. With fuse2 we get the runtime error
+#     `fusermount: exec: "fusermount3": executable file not found in $PATH`
+#     at the first rootless/userns container start (verified on the live
+#     Arch VM, 2026-05-24). Switching to fuse3 doesn't require sysbox-fs to be
+#     rebuilt against libfuse3 — the binary only calls the helper.
+#   - iptables-nft: Arch ships only the nft frontend; provides the
+#     `iptables` command sysbox-mgr shells out to
+depends=(
+    'jq'
+    'fuse3'
+    'rsync'
+    'iptables-nft'
+    'systemd'
+)
+
+# Build depends — mirrors deb/ubuntu-jammy/Dockerfile.
+#   - base-devel: gcc, make, pkgconf, fakeroot, etc. (Arch meta-group)
+#   - go: ≥ 1.22 (Arch's `go` package tracks the latest stable, currently > 1.22)
+makedepends=(
+    'base-devel'
+    'go'
+    'git'
+    'libseccomp'
+    'libnet'
+    'protobuf'
+    'curl'
+    'unzip'
+    'tar'
+    'linux-api-headers'
+)
+
+# Refuse to coexist with another sysbox flavour.
+conflicts=('sysbox' 'sysbox-ee')
+provides=('sysbox')
+
+# Source files are bind-staged by the orchestrator Makefile into the build
+# directory next to this PKGBUILD; the local:// scheme keeps makepkg from
+# trying to fetch over the network.
+source=(
+    'sysbox.tgz'
+    'sysbox.service'
+    'sysbox-fs.service'
+    'sysbox-mgr.service'
+    '99-sysbox-sysctl.conf'
+    '50-sysbox-mod.conf'
+    'sysbox-postinstall.sh'
+)
+# `SKIP` is intentional — sysbox.tgz is regenerated per build by the
+# orchestrator; the source-of-truth digest is the upstream git ref pinned
+# downstream, not a tarball hash.
+sha256sums=(
+    'SKIP'
+    'SKIP'
+    'SKIP'
+    'SKIP'
+    'SKIP'
+    'SKIP'
+    'SKIP'
+)
+
+# Pacman .install hook (post_install / post_remove). Lives at the same
+# level as this PKGBUILD.
+install=sysbox-ce.install
+
+# ARCH variable for the sysbox Makefile (matches deb convention).
+_arch='amd64'
+
+prepare() {
+    cd "${srcdir}"
+    # Untar the sysbox tree into srcdir/sysbox/ — the upstream Makefile
+    # expects to be invoked from this layout.
+    if [ ! -d sysbox ]; then
+        tar -xzf sysbox.tgz
+    fi
+}
+
+build() {
+    cd "${srcdir}/sysbox"
+
+    # Arch deviates from the deb/rpm `make sysbox-static-local` and uses
+    # the dynamic-link target `make sysbox-local` instead. Reason: Arch's
+    # `libseccomp` package ships ONLY the dynamic `libseccomp.so`; there
+    # is no `libseccomp-static` (Arch policy minimises static libs across
+    # the distro). The `-static` link of `sysbox-runc` then fails with
+    # `/usr/bin/ld: cannot find -lseccomp`. Dynamic linking is the
+    # Arch-native convention and is safe here because `libseccomp` is a
+    # runtime `depends=()` of this package, so consumers always have the
+    # `.so` available. Output binary paths are unchanged
+    # (sysbox-{fs,mgr,runc}/build/${ARCH}/*) so package() below needs no
+    # adjustment.
+    export ARCH="${_arch}"
+    make sysbox-local
+}
+
+package() {
+    cd "${srcdir}"
+
+    # Binaries — match the deb/rpm install paths.
+    install -D -m 0755 sysbox/sysbox-fs/build/${_arch}/sysbox-fs \
+        "${pkgdir}/usr/bin/sysbox-fs"
+    install -D -m 0755 sysbox/sysbox-mgr/build/${_arch}/sysbox-mgr \
+        "${pkgdir}/usr/bin/sysbox-mgr"
+    install -D -m 0755 sysbox/sysbox-runc/build/${_arch}/sysbox-runc \
+        "${pkgdir}/usr/bin/sysbox-runc"
+
+    # systemd units.
+    install -D -m 0644 sysbox.service \
+        "${pkgdir}/usr/lib/systemd/system/sysbox.service"
+    install -D -m 0644 sysbox-fs.service \
+        "${pkgdir}/usr/lib/systemd/system/sysbox-fs.service"
+    install -D -m 0644 sysbox-mgr.service \
+        "${pkgdir}/usr/lib/systemd/system/sysbox-mgr.service"
+
+    # sysctl + modules-load drop-ins.
+    install -D -m 0644 99-sysbox-sysctl.conf \
+        "${pkgdir}/usr/lib/sysctl.d/99-sysbox-sysctl.conf"
+    install -D -m 0644 50-sysbox-mod.conf \
+        "${pkgdir}/etc/modules-load.d/50-sysbox-mod.conf"
+
+    # Vendored post-install logic — invoked by sysbox-ce.install hook.
+    install -D -m 0755 sysbox-postinstall.sh \
+        "${pkgdir}/usr/lib/sysbox/sysbox-postinstall.sh"
+
+    # License (sysbox is Apache-2.0).
+    install -D -m 0644 sysbox/LICENSE \
+        "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
