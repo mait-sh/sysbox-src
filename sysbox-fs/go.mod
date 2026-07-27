@@ -1,6 +1,6 @@
 module github.com/nestybox/sysbox-fs
 
-go 1.24.0
+go 1.25.0
 
 require (
 	bazil.org/fuse v0.0.0-00010101000000-000000000000
@@ -15,13 +15,13 @@ require (
 	github.com/nestybox/sysbox-runc v0.0.0-00010101000000-000000000000
 	github.com/pkg/profile v1.5.0
 	github.com/seccomp/libseccomp-golang v0.10.0
-	github.com/sirupsen/logrus v1.9.3
+	github.com/sirupsen/logrus v1.9.4
 	github.com/spf13/afero v1.4.1
 	github.com/stretchr/testify v1.11.1
 	github.com/urfave/cli v1.22.14
 	github.com/vishvananda/netlink v1.1.0
-	golang.org/x/sys v0.38.0
-	google.golang.org/grpc v1.75.1
+	golang.org/x/sys v0.45.0
+	google.golang.org/grpc v1.82.1
 	gopkg.in/hlandau/service.v1 v1.0.7
 )
 
@@ -37,7 +37,6 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/deckarep/golang-set v1.8.0 // indirect
 	github.com/deckarep/golang-set/v2 v2.3.1 // indirect
-	github.com/docker/docker v28.0.0+incompatible // indirect
 	github.com/godbus/dbus/v5 v5.0.3 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/hashicorp/go-uuid v1.0.1 // indirect
@@ -45,6 +44,7 @@ require (
 	github.com/joshlf/go-acl v0.0.0-20200411065538-eae00ae38531 // indirect
 	github.com/karrick/godirwalk v1.16.1 // indirect
 	github.com/kr/pretty v0.1.0 // indirect
+	github.com/moby/moby/client v0.5.0 // indirect
 	github.com/moby/sys/mountinfo v0.4.0 // indirect
 	github.com/mrunalp/fileutils v0.5.0 // indirect
 	github.com/nestybox/sysbox-libs/idMap v0.0.0-00010101000000-000000000000 // indirect
@@ -54,17 +54,17 @@ require (
 	github.com/nestybox/sysbox-libs/shiftfs v0.0.0-00010101000000-000000000000 // indirect
 	github.com/opencontainers/runc v1.1.4 // indirect
 	github.com/opencontainers/runtime-spec v1.1.1-0.20230823135140-4fec88fd00a4 // indirect
-	github.com/opencontainers/selinux v1.8.0 // indirect
+	github.com/opencontainers/selinux v1.13.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/vishvananda/netns v0.0.0-20191106174202-0a2b9b5464df // indirect
 	github.com/willf/bitset v1.1.11 // indirect
-	golang.org/x/net v0.43.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20250825161204-c5933d9347a5 // indirect
-	google.golang.org/protobuf v1.36.10 // indirect
+	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
+	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

@@ -9,15 +9,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/nestybox/sysbox-libs/utils"
-
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/api/types/volume"
+	"github.com/moby/moby/client"
 )
 
 // Set to true during testing only
@@ -61,26 +58,18 @@ type Docker struct {
 
 // DockerConnect establishes a session with the Docker daemon.
 func DockerConnect() (*Docker, error) {
-
 	// Profiling shows Docker takes on average ~10ms to respond to a single
 	// client; with up to 1000 concurrent clients, it takes ~400ms to respond on
 	// average (see the TestDockerConnectDelay() test in dockerUtils_test.go).
 	// Thus we set the timeout to 1 sec; if it doesn't respond in this time, it
 	// likely means Docker is not present.
-	timeout := time.Duration(1 * time.Second)
-
-	cli, err := client.NewClientWithOpts(
-		client.FromEnv,
-		client.WithTimeout(timeout),
-		client.WithAPIVersionNegotiation(),
-	)
-
+	cli, err := client.New(client.FromEnv, client.WithTimeout(1*time.Second))
 	if err != nil {
 		return nil, newDockerErr(DockerConnErr, fmt.Sprintf("failed to connect to Docker API: %v", err))
 	}
 
 	// Get the docker data root dir (usually /var/lib/docker)
-	info, err := cli.Info(context.Background())
+	res, err := cli.Info(context.Background(), client.InfoOptions{})
 	if err != nil {
 		err2 := cli.Close()
 		if err2 != nil {
@@ -91,7 +80,7 @@ func DockerConnect() (*Docker, error) {
 
 	return &Docker{
 		cli:      cli,
-		dataRoot: info.DockerRootDir,
+		dataRoot: res.Info.DockerRootDir,
 	}, nil
 }
 
@@ -111,21 +100,17 @@ func (d *Docker) GetDataRoot() string {
 // ContainerGetImageID returns the image ID of the given container; may be
 // called during container creation.
 func (d *Docker) ContainerGetImageID(containerID string) (string, error) {
-
-	filter := filters.NewArgs()
-	filter.Add("id", containerID)
-
-	containers, err := d.cli.ContainerList(context.Background(), container.ListOptions{
+	res, err := d.cli.ContainerList(context.Background(), client.ContainerListOptions{
 		All:     true, // required since container may not yet be running
-		Filters: filter,
+		Filters: make(client.Filters).Add("id", containerID),
 	})
-
 	if err != nil {
 		return "", newDockerErr(DockerContInfoErr, err.Error())
 	}
 
+	containers := res.Items
 	if len(containers) == 0 {
-		return "", newDockerErr(DockerContInfoErr, fmt.Sprintf("container %s found", containerID))
+		return "", newDockerErr(DockerContInfoErr, fmt.Sprintf("container %s not found", containerID))
 	} else if len(containers) > 1 {
 		return "", newDockerErr(DockerContInfoErr, fmt.Sprintf("more than one container matches ID %s: %v", containerID, containers))
 	}
@@ -136,14 +121,14 @@ func (d *Docker) ContainerGetImageID(containerID string) (string, error) {
 // ContainerGetInfo returns info for the given container. Must be called
 // after the container is created.
 func (d *Docker) ContainerGetInfo(containerID string) (*ContainerInfo, error) {
-
-	info, err := d.cli.ContainerInspect(context.Background(), containerID)
+	res, err := d.cli.ContainerInspect(context.Background(), containerID, client.ContainerInspectOptions{})
 	if err != nil {
 		return nil, err
 	}
+	info := res.Container
 
 	rootfs := ""
-	if info.GraphDriver.Name == "overlay2" {
+	if info.GraphDriver != nil && info.GraphDriver.Name == "overlay2" {
 		rootfs = info.GraphDriver.Data["MergedDir"]
 	}
 
@@ -156,21 +141,18 @@ func (d *Docker) ContainerGetInfo(containerID string) (*ContainerInfo, error) {
 // ListVolumesAt lists Docker volumes with the given host mount point (which implies
 // volumes using the "local" driver only).
 func (d *Docker) ListVolumesAt(mountPoint string) ([]volume.Volume, error) {
-
-	filterArgs := filters.NewArgs()
-	filterArgs.Add("driver", "local")
-
-	// List volumes using the filter
-	volumeList, err := d.cli.VolumeList(context.Background(), volume.ListOptions{Filters: filterArgs})
+	res, err := d.cli.VolumeList(context.Background(), client.VolumeListOptions{
+		Filters: make(client.Filters).Add("driver", "local"),
+	})
 	if err != nil {
 		return nil, err
 	}
 
 	// Filter volumes by mount point
 	var filteredVolumes []volume.Volume
-	for _, vol := range volumeList.Volumes {
+	for _, vol := range res.Items {
 		if vol.Mountpoint == mountPoint {
-			filteredVolumes = append(filteredVolumes, *vol)
+			filteredVolumes = append(filteredVolumes, vol)
 			break
 		}
 	}
@@ -179,25 +161,29 @@ func (d *Docker) ListVolumesAt(mountPoint string) ([]volume.Volume, error) {
 }
 
 // ContainerIsDocker returns true if the given container ID corresponds to a
-// Docker container. It does this by first trying to query Docker for the
-// container. If this doesn't work, it uses a heuristic based on the container's
-// rootfs.
+// Docker container. It first checks the container's rootfs, which is cheap and
+// local; only if that is inconclusive does it query the Docker daemon.
 func ContainerIsDocker(id, rootfs string) (bool, error) {
 
-	docker, err := DockerConnect()
-	if err == nil {
-		defer docker.Disconnect()
-		_, err := docker.ContainerGetImageID(id)
-		return (err == nil), nil
+	// Prefer the rootfs heuristic: it avoids a Docker API query that can block
+	// for seconds while Docker is unresponsive, which happens exactly when
+	// containers are restored after a reboot (containers launched with
+	// "--restart"; see Sysbox issue #184).
+	isDocker, err := isDockerRootfs(rootfs)
+	if err == nil && isDocker {
+		return true, nil
 	}
 
-	// The connection to Docker can fail when containers are restarted
-	// automatically after reboot (i.e., containers originally launched with
-	// "--restart"); Docker won't respond until those are up. See Sysbox issue
-	// #184. In this case we determine if the container is a Docker container by
-	// examining the container's rootfs.
+	// The rootfs check was negative or errored; ask Docker directly.
+	docker, derr := DockerConnect()
+	if derr == nil {
+		defer docker.Disconnect()
+		_, gerr := docker.ContainerGetImageID(id)
+		return (gerr == nil), nil
+	}
 
-	return isDockerRootfs(rootfs)
+	// Docker is unreachable; fall back to the rootfs heuristic result.
+	return isDocker, err
 }
 
 // isDockerRootfs determines if the given a container rootfs is for a Docker container.
@@ -221,7 +207,7 @@ func isDockerRootfs(rootfs string) (bool, error) {
 	maxFilesPerDir := 30 // the docker data root dir has typically 10->20 subdirs in it
 	path := rootfs
 
-	for i := 0; i < searchLevels; i++ {
+	for range searchLevels {
 		path = filepath.Dir(path)
 
 		dir, err := os.Open(path)
@@ -236,7 +222,7 @@ func isDockerRootfs(rootfs string) (bool, error) {
 
 		isDocker := true
 		for _, dockerDir := range dockerDirs {
-			if !utils.StringSliceContains(filenames, dockerDir) {
+			if !slices.Contains(filenames, dockerDir) {
 				isDocker = false
 			}
 		}
