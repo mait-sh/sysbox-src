@@ -1,4 +1,8 @@
 deb/build
 deb/sources
+rpm/rpmbuild
+rpm/sources
+arch/archbuild
+arch/sources
 sources
 sysbox
