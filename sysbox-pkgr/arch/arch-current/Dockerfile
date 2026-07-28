@@ -14,7 +14,7 @@
 #  - No Docker-in-Docker: makepkg drives the build directly.
 #
 
-ARG GO_IMAGE=golang:1.22
+ARG GO_IMAGE=golang:1.25
 ARG BASE_IMAGE=archlinux:latest
 
 FROM ${GO_IMAGE} as golang
@@ -65,7 +65,8 @@ RUN if [ "${arch}" = "amd64" ]; then arch_str="x86_64"; \
     && curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v3.15.8/protoc-3.15.8-linux-${arch_str}.zip \
     && unzip protoc-3.15.8-linux-${arch_str}.zip -d /usr/local \
     && rm -f protoc-3.15.8-linux-${arch_str}.zip \
-    && go install github.com/golang/protobuf/protoc-gen-go@latest \
+    && go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10 \
+    && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1 \
     && chmod -R a+rX /usr/local/include/google
 
 # Same kernel-API compatibility sed patch as the deb/rpm Dockerfiles.

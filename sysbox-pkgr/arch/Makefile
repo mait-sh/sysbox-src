@@ -24,7 +24,7 @@ endif
 
 # Go base image (multi-stage source).
 GO_BASE_IMAGE=golang
-GO_VERSION:=1.22
+GO_VERSION:=1.25
 GO_IMAGE=$(GO_BASE_IMAGE):$(GO_VERSION)
 
 # Sysbox source location, same logic as deb/Makefile + rpm/Makefile.
