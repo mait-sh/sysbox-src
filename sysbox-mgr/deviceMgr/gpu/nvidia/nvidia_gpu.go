@@ -63,3 +63,7 @@ func (d *nvidiaDevicer) Create(device *specs.LinuxDevice) error {
 func (d *nvidiaDevicer) CreateByDefault() bool {
 	return false
 }
+
+func (d *nvidiaDevicer) Clone() bool {
+	return false
+}

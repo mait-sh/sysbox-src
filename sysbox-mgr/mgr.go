@@ -74,6 +74,7 @@ type containerInfo struct {
 	mntPrepRev             []mntPrepRevInfo
 	reqMntInfos            []mountInfo
 	containerMnts          []specs.Mount
+	containerDevs          []specs.LinuxDevice
 	shiftfsMarks           []shiftfs.MountPoint
 	autoRemove             bool
 	userns                 string
@@ -218,8 +219,8 @@ func newSysboxMgr(ctx *cli.Context) (*SysboxMgr, error) {
 	}
 
 	deviceMgr := deviceMgr.New(sysboxLibDir + "/devices")
-	if err != nil {
-		return nil, fmt.Errorf("failed to setup device mgr: %v", err)
+	if deviceMgr == nil {
+		return nil, fmt.Errorf("failed to setup device mgr")
 	}
 
 	rootfsCloner := rootfsCloner.New(sysboxLibDir)
@@ -971,8 +972,12 @@ func (mgr *SysboxMgr) setupDevices(id string, devices []specs.LinuxDevice) ([]sp
 	}
 
 	// If this is a stopped container that is being re-started, reuse its prior devices.
+	// The cloned device nodes on the host persist across restart (they are removed only
+	// when the container is removed), so we return the same set of devices we kept in the
+	// spec on first setup rather than re-cloning them; the devMgr's DeviceMounts() still
+	// yields the bind-mounts for the cloned devices.
 	if info.state == restarted {
-		return nil, nil
+		return info.containerDevs, nil
 	}
 
 	res, err := mgr.deviceMgr.SetupDevices(id, info.uidMappings[0].HostID, info.gidMappings[0].HostID, devices)
@@ -980,6 +985,12 @@ func (mgr *SysboxMgr) setupDevices(id string, devices []specs.LinuxDevice) ([]sp
 		return nil, fmt.Errorf("failed to setup system devices for container %s: %s",
 			formatter.ContainerID{id}, err)
 	}
+
+	info.containerDevs = res
+
+	mgr.ctLock.Lock()
+	mgr.contTable[id] = info
+	mgr.ctLock.Unlock()
 
 	return res, nil
 }
