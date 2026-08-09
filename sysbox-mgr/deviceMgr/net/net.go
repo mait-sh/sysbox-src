@@ -50,6 +50,10 @@ func (d *netDevicer) CreateByDefault() bool {
 	return true
 }
 
+func (d *netDevicer) Clone() bool {
+	return false
+}
+
 func discoverNetTunDev() (*specs.LinuxDevice, error) {
 	info, err := os.Stat(netTunPath)
 	if err != nil {

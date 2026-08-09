@@ -23,3 +23,7 @@ func (d *amdDevicer) Create(device *specs.LinuxDevice) error {
 func (d *amdDevicer) CreateByDefault() bool {
 	return false
 }
+
+func (d *amdDevicer) Clone() bool {
+	return false
+}
