@@ -16,11 +16,9 @@ import (
 	intelGpu "github.com/nestybox/sysbox-mgr/deviceMgr/gpu/intel"
 	nvidiaGpu "github.com/nestybox/sysbox-mgr/deviceMgr/gpu/nvidia"
 	"github.com/nestybox/sysbox-mgr/deviceMgr/net"
+	"github.com/nestybox/sysbox-mgr/deviceMgr/passthrough"
 	"github.com/nestybox/sysbox-mgr/deviceMgr/root"
 )
-
-// sysboxDevDir is the host directory where the devMgr's devices are created.
-const sysboxDevDir = "/var/lib/sysbox/devices"
 
 // devicer is the interface that wraps the methods required to obtain, configure
 // and create devices in the system for a given device type.
@@ -44,6 +42,13 @@ type devicer interface {
 	// This is useful for devices that are normally present in the system, and that
 	// are required for basic functionality (e.g., /dev/net/tun).
 	CreateByDefault() bool
+
+	// Clone returns true if the devicer handles a matched device by cloning it onto a
+	// regular filesystem (chowned to the container's mapped-root uid:gid and bind-mounted
+	// into the container), rather than letting the original device node pass through to
+	// the container's oci-spec. When true, the devMgr drops the device from the list
+	// returned to sysbox-runc and delivers it via a bind-mount instead (no shiftfs needed).
+	Clone() bool
 }
 
 // External interface for the device manager.
@@ -116,6 +121,18 @@ func New(hostDir string) *DeviceMgr {
 	m.devicerTree = tree
 
 	tree, _, _ = m.devicerTree.Insert([]byte("/dev/intel"), intelGpu.NewIntelDevicer())
+	m.devicerTree = tree
+
+	// Passthrough devices: user-requested devices whose host node is cloned onto a
+	// regular filesystem and bind-mounted into the container (chowned to mapped-root,
+	// no shiftfs). This is an explicit prefix allow-list.
+	tree, _, _ = m.devicerTree.Insert([]byte("/dev/kvm"), passthrough.NewPassthroughDevicer())
+	m.devicerTree = tree
+
+	tree, _, _ = m.devicerTree.Insert([]byte("/dev/dri"), passthrough.NewPassthroughDevicer())
+	m.devicerTree = tree
+
+	tree, _, _ = m.devicerTree.Insert([]byte("/dev/dxg"), passthrough.NewPassthroughDevicer())
 	m.devicerTree = tree
 
 	return m
@@ -191,6 +208,21 @@ func (m *DeviceMgr) SetupDevices(
 			res = append(res, d)
 			continue
 		}
+
+		// If the matched devicer clones the device, create the clone now (on a regular
+		// filesystem, chowned to the container's mapped-root uid:gid) and drop the device
+		// from the list returned to sysbox-runc. The device reaches the container via a
+		// bind-mount (see DeviceMounts) rather than as an un-shifted device node, so it
+		// shows up as "0:0" inside the container without requiring shiftfs. Note we do not
+		// touch spec.Linux.Resources.Devices, so Docker's cgroup allow rule still rides
+		// through and the node remains openable inside the container.
+		if devicer.Clone() {
+			if err := m.createDevice(cid, uid, gid, discoveredDev); err != nil {
+				return nil, fmt.Errorf("failed to clone device %s for container %s: %s", d.Path, cid, err)
+			}
+			continue
+		}
+
 		res = append(res, *discoveredDev)
 	}
 

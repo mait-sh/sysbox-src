@@ -23,3 +23,7 @@ func (d *intelDevicer) Create(device *specs.LinuxDevice) error {
 func (d *intelDevicer) CreateByDefault() bool {
 	return false
 }
+
+func (d *intelDevicer) Clone() bool {
+	return false
+}
