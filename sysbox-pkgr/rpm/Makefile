@@ -30,15 +30,15 @@ endif
 # deb/Makefile's GO_VERSION). The legacy fedora-31 / fedora-32 / centos-8
 # targets are left in place but are not maintained — only `fedora-42`
 # has a working Dockerfile under this directory.
-GO_BASE_IMAGE=golang
+GO_BASE_IMAGE=docker.io/library/golang
 GO_VERSION:=1.25
 GO_IMAGE=$(GO_BASE_IMAGE):$(GO_VERSION)
 
 # Sysbox source-code locations.
 ifeq ($(EDITION),ce)
-	SYSBOX_DIR  := $(CURDIR)/../sources/sysbox
+	SYSBOX_DIR  := $(realpath $(CURDIR)/../sources/sysbox)
 else ifeq ($(EDITION),ee)
-	SYSBOX_DIR  := $(CURDIR)/../sources/sysbox-internal
+	SYSBOX_DIR  := $(realpath $(CURDIR)/../sources/sysbox-internal)
 else
 	echo "Unsupported Sysbox edition: $(EDITION)"
 	exit 1
@@ -56,7 +56,7 @@ SOURCE_FILES =  sysbox.tgz           \
 
 SOURCES=$(addprefix sources/, $(SOURCE_FILES))
 
-CHOWN:=docker run --rm -v $(CURDIR):/v -w /v alpine chown
+CHOWN:=docker run --rm -v $(CURDIR):/v:Z -w /v docker.io/library/alpine:3.20 chown
 
 DOCKER_BUILD=docker build                                  \
 	--build-arg GO_IMAGE=$(GO_IMAGE)                       \
@@ -67,8 +67,8 @@ DOCKER_BUILD=docker build                                  \
 
 DOCKER_RUN=docker run --rm -i                    \
 	-e EDITION                                   \
-	-v $(CURDIR)/rpmbuild/$@:/build              \
-	-v $(GOPATH)/pkg/mod:/go/pkg/mod             \
+	-v $(CURDIR)/rpmbuild/$@:/build:Z            \
+	--mount type=volume,source=sysbox-go-mod-cache,target=/go/pkg/mod \
 	rpmbuild-$@/$(ARCH)
 
 
@@ -110,6 +110,7 @@ fedora-32: $(SOURCES)
 fedora-42: ## Build Fedora-42 RPM package
 fedora-42: $(SOURCES)
 	@echo "== Building RPM package for $@ =="
+	@mkdir -p rpmbuild/$@
 	$(DOCKER_BUILD)
 	$(DOCKER_RUN)
 	$(CHOWN) -R $(shell id -u):$(shell id -g) rpmbuild/$@
@@ -123,9 +124,9 @@ clean: ## Remove build artifacts
 sources/sysbox.tgz:
 	mkdir -p $(@D)
 	docker run --rm -i -w /v \
-		-v $(SYSBOX_DIR):/sysbox \
-		-v $(CURDIR)/$(@D):/v \
-		alpine \
+		-v $(SYSBOX_DIR):/sysbox:ro,Z \
+		-v $(CURDIR)/$(@D):/v:Z \
+		docker.io/library/alpine:3.20 \
 		tar -C / -czf /v/sysbox.tgz --exclude .git --exclude='sysbox-pkgr' sysbox
 
 sources/sysbox.service: ../systemd/sysbox.service
