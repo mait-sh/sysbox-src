@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#
+# In-container build helper for the sysbox-ce Arch package.
+# Parallel to deb/build-deb and rpm/build-rpm.
+#
+# Runs as the unprivileged `build` user (makepkg refuses root). Syncs the
+# upstream sysbox VERSION into the PKGBUILD's pkgver field, then invokes
+# makepkg. Artefacts are copied to /build (the orchestrator bind-mount
+# target), mirroring the deb/rpm conventions.
+#
+
+set -x
+set -e
+
+cd /home/build/build-arch
+
+# Extract sysbox VERSION so we can keep pkgver in sync with the upstream
+# tree without manual edits. The actual extraction the PKGBUILD performs
+# happens later inside prepare() — we just peek at VERSION here.
+mkdir -p /tmp/sysbox-peek
+tar -xzf sysbox.tgz -C /tmp/sysbox-peek sysbox/VERSION
+UPSTREAM_VERSION=$(cat /tmp/sysbox-peek/sysbox/VERSION)
+PKG_VERSION=$(awk -F= '/^pkgver=/ {print $2}' PKGBUILD)
+
+if [ "${UPSTREAM_VERSION}" != "${PKG_VERSION}" ]; then
+    echo "WARN PKGBUILD pkgver (${PKG_VERSION}) != sysbox/VERSION (${UPSTREAM_VERSION}); patching for this build"
+    sed -i "s/^pkgver=.*/pkgver=${UPSTREAM_VERSION}/" PKGBUILD
+fi
+
+# The Go module cache (GOPATH=/go, so $GOPATH/pkg/mod) is bind-mounted
+# from the host's $GOPATH/pkg/mod by arch/Makefile's DOCKER_RUN, exactly
+# like the deb/rpm legs, so all three share one persistent module cache.
+# The deb/rpm containers run their whole build as root, so root's implicit
+# DAC-override lets them write into that host-owned mount point without
+# any extra step. makepkg refuses to run as root (see arch-current/
+# Dockerfile), so this script runs as the unprivileged `build` user, and
+# the bind mount's ownership doesn't match `build`'s uid. Left alone,
+# `go build` fails on the first cache write with
+# "mkdir /go/pkg/mod/cache: permission denied" (Makefile:155 in
+# sysbox-runc). Reclaim ownership before invoking makepkg — `build` has
+# passwordless sudo for exactly this kind of setup step (same pattern as
+# the `/build` copy-out below).
+sudo mkdir -p /go/pkg/mod
+sudo chown -R build:build /go
+
+# Build the package. `-L` keeps a per-step log under ./*.log for
+# debuggability. `--noconfirm` because the build container has passwordless
+# sudo and no interactive TTY.
+makepkg --noconfirm -L --skipinteg
+
+# Copy artefacts out to the orchestrator bind-mount target.
+sudo mkdir -p /build
+sudo cp -v sysbox-ce-*.pkg.tar.zst /build/
+sudo cp -v *.log /build/ 2>/dev/null || true
+sudo chown -R "$(id -u):$(id -g)" /build || true

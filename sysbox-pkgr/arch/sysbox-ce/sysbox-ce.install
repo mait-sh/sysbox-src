@@ -1,0 +1,68 @@
+# Pacman .install hook for sysbox-ce.
+#
+# Pacman dispatches install / upgrade / remove events to the named
+# functions. We delegate the heavy lifting (sysctl tuning, sysbox user,
+# /etc/docker/daemon.json merge) to the same vendored shell script the
+# RPM %post calls, so all three packagers (deb / rpm / arch) end up in
+# the same post-install state.
+
+post_install() {
+    # systemd unit reload + enable. Match the deb's
+    # `dh_installsystemd --name=sysbox{,-fs,-mgr}` outcome.
+    systemctl daemon-reload || true
+    systemctl enable sysbox.service sysbox-fs.service sysbox-mgr.service || true
+
+    # Host configuration script (idempotent — safe on upgrade).
+    if [ -x /usr/lib/sysbox/sysbox-postinstall.sh ]; then
+        /usr/lib/sysbox/sysbox-postinstall.sh || true
+    fi
+
+    # Best-effort kernel minimum check (matches deb preinst + rpm %pre).
+    kver=$(uname -r | cut -d'-' -f1)
+    required="5.5.0"
+    lowest=$(printf '%s\n%s\n' "$kver" "$required" | sort -V | head -n1)
+    if [ "$lowest" != "$required" ]; then
+        echo "WARN linux kernel '$kver' is older than sysbox's minimum '$required'." >&2
+        echo "  Suggestion: upgrade the kernel package, then retry sysbox-ce" >&2
+    fi
+}
+
+post_upgrade() {
+    # Same idempotent set on upgrade. Don't re-enable (user may have
+    # disabled deliberately); just reload to pick up unit changes.
+    systemctl daemon-reload || true
+    if [ -x /usr/lib/sysbox/sysbox-postinstall.sh ]; then
+        /usr/lib/sysbox/sysbox-postinstall.sh || true
+    fi
+    # Best-effort restart of running units so they pick up the new binary.
+    for unit in sysbox-mgr.service sysbox-fs.service sysbox.service; do
+        if systemctl is-active --quiet "$unit"; then
+            systemctl restart "$unit" || true
+        fi
+    done
+}
+
+pre_remove() {
+    systemctl stop sysbox.service sysbox-fs.service sysbox-mgr.service || true
+    systemctl disable sysbox.service sysbox-fs.service sysbox-mgr.service || true
+}
+
+post_remove() {
+    systemctl daemon-reload || true
+
+    # Mirror deb postrm `purge` branch: strip sysbox-runc from daemon.json
+    # so docker stops trying to use a missing runtime. We do NOT remove
+    # the sysbox user (file ownership concerns, same rationale as deb).
+    cfg=/etc/docker/daemon.json
+    if [ -f "$cfg" ] && command -v jq >/dev/null 2>&1; then
+        if [ "$(jq 'has("runtimes")' "$cfg")" = "true" ] && \
+           [ "$(jq '.runtimes | has("sysbox-runc")' "$cfg")" = "true" ]; then
+            tmp=$(mktemp /tmp/sysbox-postrm.XXXXXX)
+            jq 'del(.runtimes."sysbox-runc")' "$cfg" > "$tmp" && cp "$tmp" "$cfg"
+            rm -f "$tmp"
+            if command -v docker >/dev/null 2>&1 && pidof dockerd >/dev/null 2>&1; then
+                kill -SIGHUP "$(pidof dockerd)" || true
+            fi
+        fi
+    fi
+}
