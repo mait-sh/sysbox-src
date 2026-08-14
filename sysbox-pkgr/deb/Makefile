@@ -36,7 +36,7 @@ RELEASE_BASELINE_IMAGE=ubuntu-noble
 
 # Go version to utilize in building process.
 GO_BASE_IMAGE=golang
-GO_VERSION:=1.22
+GO_VERSION:=1.25
 GO_IMAGE=$(GO_BASE_IMAGE):$(GO_VERSION)
 
 # Sysbox source-code locations.

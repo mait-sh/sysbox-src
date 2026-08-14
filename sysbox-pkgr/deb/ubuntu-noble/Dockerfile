@@ -65,7 +65,8 @@ RUN if [ "${arch}" = "amd64" ]; then arch_str="x86_64"; \
     && curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v3.15.8/protoc-3.15.8-linux-${arch_str}.zip \
     && unzip protoc-3.15.8-linux-${arch_str}.zip -d $HOME/.local \
     && export PATH="$PATH:$HOME/.local/bin" \
-    && go install github.com/golang/protobuf/protoc-gen-go@latest \
+    && go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10 \
+    && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1 \
     && export PATH="$PATH:$(go env GOPATH)/bin"
 
 # Install Docker

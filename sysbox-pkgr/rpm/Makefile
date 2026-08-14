@@ -31,7 +31,7 @@ endif
 # targets are left in place but are not maintained — only `fedora-42`
 # has a working Dockerfile under this directory.
 GO_BASE_IMAGE=golang
-GO_VERSION:=1.22
+GO_VERSION:=1.25
 GO_IMAGE=$(GO_BASE_IMAGE):$(GO_VERSION)
 
 # Sysbox source-code locations.
