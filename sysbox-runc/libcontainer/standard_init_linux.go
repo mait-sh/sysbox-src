@@ -64,6 +64,7 @@ type opReq struct {
 	Uid     int         `json:"uid"`
 	Gid     int         `json:"gid"`
 	UidSize int         `json:"uid_size"`
+	GidSize int         `json:"gid_size"`
 	Mode    os.FileMode `json:"mode"`
 }
 

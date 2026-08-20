@@ -289,58 +289,140 @@ func doDockerDnsSwitch(oldDns, newDns string) error {
 	return nil
 }
 
-// upperHasOutOfRangeUids returns true if the overlayfs upper layer contains
-// any child entry whose uid is outside the expected mapped range [hostUID, hostUID+size).
+// idInContainerRange reports whether the given host ID falls inside the
+// container's mapped range [hostID, hostID+size).
+func idInContainerRange(id, hostID, size int) bool {
+	return size > 0 && id >= hostID && id < hostID+size
+}
+
+// upperIsFullyUnshifted reports whether the overlayfs upper layer can safely be
+// handed to a blanket transform -- either an ID-mapped mount or a recursive
+// chown by +hostUID -- because none of its entries sit inside the container's ID
+// range yet.
 //
-// This guards against applying id-mapping to an upper layer that already has
-// host-range uids on disk (e.g. written by an older sysbox version that used
-// ShiftIdsWithChown, or by a fresh container that hasn't been touched). For the
-// common case of an empty upper layer this returns false immediately.
+// Both transforms are only correct for content owned by IDs below that range:
 //
-// The upper directory itself (path == upper) is always uid=0 when Docker's
-// overlayfs snapshotter creates it — this is expected and is NOT a sign of
-// previously-chowned content. The check is scoped to child entries only.
+//   - An ID-mapped mount reads an on-disk ID as an ID *inside* the container's
+//     user-ns. On-disk 0 therefore resolves to hostUID and the container sees 0,
+//     but on-disk hostUID has no mapping in the user-ns and resolves to the
+//     overflow ID (nobody:nogroup).
+//   - A recursive chown adds hostUID to every entry, so an entry already at
+//     hostUID lands at 2*hostUID, outside the range, and also becomes nobody.
 //
-// The walk is capped at maxEntries to keep the probe cheap on large layers.
-func upperHasOutOfRangeUids(upper string, hostUID, uidSize int) bool {
-	const maxEntries = 64
+// So an upper layer that already carries shifted content must be left alone by
+// both, which is what the caller's selective path does. Note this is the
+// opposite of what the ownership of the upper *directory* alone suggests: that
+// directory is chowned into the range by sysbox-mgr while the container runs and
+// is only reverted on a clean stop, so an upper left behind by a host reboot is
+// in-range even when it holds no children at all. It is therefore included in
+// the scan rather than skipped.
+//
+// The scan stops at maxEntries so that a large upper layer does not make
+// container start expensive. Hitting the cap means "cannot prove it is
+// unshifted", which is reported as false: the caller then takes the selective
+// path, which is correct for any mix of shifted and unshifted content.
+func upperIsFullyUnshifted(upper string, hostUID, uidSize int) bool {
+	const maxEntries = 512
 
 	count := 0
-	outOfRange := false
+	fullyUnshifted := true
 
+	// Any condition that leaves the state of an entry unknown (walk error,
+	// unreadable entry, cap reached) must fail closed, i.e. report false.
 	_ = filepath.WalkDir(upper, func(path string, d os.DirEntry, err error) error {
-		if err != nil || count >= maxEntries {
+		if err != nil {
+			fullyUnshifted = false
 			return filepath.SkipAll
 		}
-		count++
 
-		// The upper dir's own root entry is always uid=0 — skip it.
-		// Only child entries reflect whether the upper has been previously
-		// chown-shifted and thus must not be id-mapped a second time.
-		if path == upper {
-			return nil
+		count++
+		if count > maxEntries {
+			fullyUnshifted = false
+			return filepath.SkipAll
 		}
 
 		fi, err := d.Info()
 		if err != nil {
-			return nil
-		}
-		st, ok := fi.Sys().(*syscall.Stat_t)
-		if !ok {
-			return nil
+			fullyUnshifted = false
+			return filepath.SkipAll
 		}
 
-		// Flag any child uid outside [hostUID, hostUID+size).
-		uid := int(st.Uid)
-		if uid < hostUID || uid >= hostUID+uidSize {
-			outOfRange = true
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			fullyUnshifted = false
+			return filepath.SkipAll
+		}
+
+		if idInContainerRange(int(st.Uid), hostUID, uidSize) {
+			fullyUnshifted = false
 			return filepath.SkipAll
 		}
 
 		return nil
 	})
 
-	return outOfRange
+	return fullyUnshifted
+}
+
+// shiftUnmappedUpperIds shifts the entries of the overlayfs upper layer that are
+// still owned by IDs outside the container's range, leaving entries already
+// inside the range untouched. A layer holding a mix of shifted and unshifted
+// content therefore converges to a fully shifted layer without any entry being
+// shifted twice, and a layer that is already fully shifted is left as-is.
+//
+// Skipping in-range entries also makes this naturally hard-link safe: once an
+// inode has been shifted it falls inside the range, so reaching the same inode
+// again through another link leaves it alone.
+func shiftUnmappedUpperIds(upper string, hostUID, hostGID, uidSize, gidSize int) error {
+	return filepath.WalkDir(upper, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		fi, err := d.Info()
+		if err != nil {
+			// The entry went away mid-walk; there is nothing left to shift.
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("failed to convert to syscall.Stat_t for %s", path)
+		}
+
+		targetUid := int(st.Uid)
+		if !idInContainerRange(targetUid, hostUID, uidSize) {
+			targetUid += hostUID
+		}
+
+		targetGid := int(st.Gid)
+		if !idInContainerRange(targetGid, hostGID, gidSize) {
+			targetGid += hostGID
+		}
+
+		if targetUid == int(st.Uid) && targetGid == int(st.Gid) {
+			return nil
+		}
+
+		// Don't follow symlinks: the link itself is shifted here, and its target
+		// is shifted when the walk reaches it.
+		if err := unix.Lchown(path, targetUid, targetGid); err != nil {
+			return fmt.Errorf("chown %s to %d:%d failed: %s", path, targetUid, targetGid, err)
+		}
+
+		// chown clears the set-user-ID and set-group-ID bits, so restore them.
+		fMode := fi.Mode()
+		if fMode.IsRegular() && fMode&(os.ModeSetuid|os.ModeSetgid) != 0 {
+			if err := os.Chmod(path, fMode); err != nil {
+				return fmt.Errorf("chmod %s to %s failed: %s", path, fMode, err)
+			}
+		}
+
+		return nil
+	})
 }
 
 // Init performs container's rootfs initialization actions from
@@ -363,6 +445,7 @@ func (l *linuxRootfsInit) Init() error {
 		uid := l.reqs[0].Uid
 		gid := l.reqs[0].Gid
 		uidSize := l.reqs[0].UidSize
+		gidSize := l.reqs[0].GidSize
 
 		usernsPath := "/proc/1/ns/user"
 
@@ -488,24 +571,33 @@ func (l *linuxRootfsInit) Init() error {
 			}
 			ovfsMntOpts.Opts = strings.Join(opts, ",")
 
-			// Choose the upper layer strategy: id-map (kernel >= 5.19, probe passed)
-			// or chown (fallback for older kernels or unsupported filesystems).
+			// Choose how to handle the overlayfs upper layer.
 			//
-			// When id-mapping is used:
-			//   - writes through the merged overlayfs mount from outside the
-			//     container's userns (e.g. "docker cp") are translated by the
-			//     kernel: host uid 0 → stored as uid X on disk.
-			//   - container processes in userns (0→X) read uid X as uid 0. ✓
-			//   - this eliminates the nobody:nogroup bug seen with "docker cp".
+			// ID-mapping it is preferred (kernel >= 5.19 and the sysbox-mgr probe
+			// passed): writes through the merged overlayfs mount from outside the
+			// container's user-ns (e.g. "docker cp") then land on disk as uid 0
+			// and the kernel resolves them to the container's mapped ID, so they
+			// no longer show up as nobody:nogroup inside the container.
 			//
-			// Both strategies produce the same on-disk uid range (the mapped
-			// range, e.g. 100000+). A container previously started under the
-			// chown strategy can be restarted under the id-map strategy without
-			// migration because ShiftIdsWithChown and MOUNT_ATTR_IDMAP both use
-			// the same HostID offset.
-			useIDMap := l.reqs[0].OverlayfsUpperIDMap && !upperHasOutOfRangeUids(ovfsUpperLayer, uid, uidSize)
+			// Both ID-mapping and the chown fallback are blanket transforms, and
+			// both assume the upper layer's content is still owned by host IDs
+			// below the container's range. Applying either to content that has
+			// already been shifted into the range corrupts its ownership (see
+			// upperIsFullyUnshifted). That happens in practice: sysbox-mgr chowns
+			// the upper layer while the container runs and only reverts it on a
+			// clean stop, so a host reboot or a killed sysbox-mgr leaves an
+			// already-shifted layer behind, possibly mixed with uid 0 entries
+			// written into the merged mount afterwards.
+			//
+			// So only take a blanket transform when the layer is provably still
+			// unshifted; otherwise shift just the entries that need it.
+			blanketShiftSafe := upperIsFullyUnshifted(ovfsUpperLayer, uid, uidSize)
 
-			if useIDMap {
+			if !blanketShiftSafe {
+				if err := shiftUnmappedUpperIds(ovfsUpperLayer, uid, gid, uidSize, gidSize); err != nil {
+					return newSystemErrorWithCausef(err, "shifting unmapped IDs on overlayfs upper layer at %s", ovfsUpperLayer)
+				}
+			} else if l.reqs[0].OverlayfsUpperIDMap {
 				// Id-map upperdir in place: open_tree(CLONE) + mount_setattr(MOUNT_ATTR_IDMAP)
 				// + move_mount. unmountFirst=false because the upper is a plain directory,
 				// not its own mountpoint; the idmapped clone stacks on top of it.

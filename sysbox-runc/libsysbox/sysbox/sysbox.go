@@ -19,6 +19,7 @@ package sysbox
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -98,14 +99,64 @@ func checkKernelVersion(distro string) error {
 	return nil
 }
 
+// rootfsIDProbePaths are paths that exist in virtually every container image
+// and are owned by root inside the image. On an overlayfs rootfs they are
+// served from the image (lower) layers, so their ownership reflects whether the
+// image content itself has been ID-shifted, independently of the ownership of
+// the rootfs directory (which comes from the overlayfs upper layer).
+var rootfsIDProbePaths = []string{
+	"etc/passwd",
+	"usr/bin",
+	"bin",
+	"sbin",
+	"lib",
+	"etc",
+	"usr",
+}
+
+// idIsMapped reports whether the given host ID falls within the container's
+// mapped range [hostIDMap, hostIDMap+size).
+func idIsMapped(id, hostIDMap, size uint32) bool {
+	return size > 0 && id >= hostIDMap && id-hostIDMap < size
+}
+
+// rootfsHasUnmappedIDs samples a few well-known image paths under the rootfs and
+// reports whether any of them is still owned by host ID 0 while the container
+// maps its root to a non-zero host ID. Such content is not resolvable inside the
+// container's user-ns and would surface as nobody:nogroup (65534).
+//
+// The probe is a fixed, small number of lstat() calls (no walk), so its cost is
+// negligible relative to container start.
+func rootfsHasUnmappedIDs(rootfs string, hostUidMap, hostGidMap uint32) bool {
+	for _, p := range rootfsIDProbePaths {
+		fi, err := os.Lstat(filepath.Join(rootfs, p))
+		if err != nil {
+			continue
+		}
+
+		st, ok := fi.Sys().(*syscall.Stat_t)
+		if !ok {
+			continue
+		}
+
+		if (st.Uid == 0 && hostUidMap != 0) || (st.Gid == 0 && hostGidMap != 0) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // needUidShiftOnRootfs checks if uid/gid shifting is required on the container's rootfs.
 func needUidShiftOnRootfs(spec *specs.Spec) (bool, error) {
 	var hostUidMap, hostGidMap uint32
+	var uidMapSize, gidMapSize uint32
 
 	// the uid map is assumed to be present
 	for _, mapping := range spec.Linux.UIDMappings {
 		if mapping.ContainerID == 0 {
 			hostUidMap = mapping.HostID
+			uidMapSize = mapping.Size
 			break
 		}
 	}
@@ -114,6 +165,7 @@ func needUidShiftOnRootfs(spec *specs.Spec) (bool, error) {
 	for _, mapping := range spec.Linux.GIDMappings {
 		if mapping.ContainerID == 0 {
 			hostGidMap = mapping.HostID
+			gidMapSize = mapping.Size
 			break
 		}
 	}
@@ -139,6 +191,35 @@ func needUidShiftOnRootfs(spec *specs.Spec) (bool, error) {
 	if rootfsUid == 0 && rootfsGid == 0 &&
 		hostUidMap != rootfsUid && hostGidMap != rootfsGid {
 		return true, nil
+	}
+
+	// The ownership of the rootfs directory alone is not conclusive: when the
+	// rootfs is on overlayfs, that directory inherits its ownership from the
+	// upper layer, not from the image.
+	//
+	// sysbox-mgr chowns the upper layer into the container's ID range while the
+	// container runs and reverts that chown when the container stops or pauses.
+	// If the revert never happens (host reboot, or sysbox-mgr killed while
+	// containers are running), the upper layer -- and hence the rootfs directory
+	// -- stays in the mapped range across the restart, while the image content
+	// in the lower layers is still owned by host ID 0.
+	//
+	// The check above then concludes "no shift needed" and we skip ID-shifting
+	// for the whole rootfs. Every image file is then left unmapped inside the
+	// container's user-ns: files show up as nobody:nogroup (65534) and setuid
+	// binaries such as sudo stop working.
+	//
+	// So when the rootfs directory already looks mapped, sample a few image-owned
+	// paths underneath it. If any of them is still owned by an unmapped host ID,
+	// shifting is still required. Scoping the probe to the "already mapped"
+	// case keeps the original behavior everywhere else, and sampling image paths
+	// (rather than any file) avoids mistaking a stray root-owned file written
+	// through the merged mount for an unshifted rootfs.
+	if idIsMapped(rootfsUid, hostUidMap, uidMapSize) ||
+		idIsMapped(rootfsGid, hostGidMap, gidMapSize) {
+		if rootfsHasUnmappedIDs(rootfs, hostUidMap, hostGidMap) {
+			return true, nil
+		}
 	}
 
 	return false, nil

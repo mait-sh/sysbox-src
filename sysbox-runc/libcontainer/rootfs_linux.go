@@ -1313,6 +1313,7 @@ func doRootfsIDMapping(config *configs.Config, pipe io.ReadWriter) error {
 			Uid:                 config.UidMappings[0].HostID,
 			Gid:                 config.GidMappings[0].HostID,
 			UidSize:             config.UidMappings[0].Size,
+			GidSize:             config.GidMappings[0].Size,
 			OverlayfsUpperIDMap: config.OverlayfsUpperIDMap,
 		},
 	}
