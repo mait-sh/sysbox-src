@@ -22,9 +22,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/nestybox/sysbox-fs/domain"
 	unixIpc "github.com/nestybox/sysbox-ipc/unix"
@@ -131,6 +134,68 @@ type seccompSession struct {
 	fd     int32  // tracee's seccomp-fd to allow kernel interaction
 	pidfd  int32  // fd associated to tracee's pid to influence poll() cycle
 	cntrId string // container(id) on which each seccomp session lives
+}
+
+// seccompFdPollShouldBreak reports whether a seccomp-fd poll result should
+// end the session loop. POLLIN must be processed even when combined with
+// POLLHUP/ERR; closing the listener while notifications
+// are pending makes the kernel answer them with ENOSYS.
+//
+// Pure POLLHUP is the normal "filter users == 0" teardown on kernels with
+// unused-notif support; callers must still decide whether the pid/filter is
+// genuinely gone before closing (see sessionStillLive).
+func seccompFdPollShouldBreak(revents int16) bool {
+	if revents&unix.POLLIN != 0 {
+		return false
+	}
+	// Keep retrying on ERR/NVAL alone — they do not mean the filter is dead.
+	if revents&(unix.POLLHUP) != 0 {
+		return true
+	}
+	return revents == 0
+}
+
+// sessionStillLive is a cheap liveness check before closing a notify fd on
+// POLLHUP. A live pid with POLLHUP is the premature-close hazard that turns
+// subsequent traps into ENOSYS for that filter.
+func sessionStillLive(pid uint32) bool {
+	if pid == 0 {
+		return false
+	}
+	err := unix.Kill(int(pid), 0)
+	return err == nil
+}
+
+// sessionIsZombie reports whether /proc/<pid>/stat shows state Z. Kill(pid,0)
+// still succeeds for unreaped zombies, so POLLHUP deferral would otherwise
+// burn ~1s per short-lived exec session teardown.
+func sessionIsZombie(pid uint32) bool {
+	if pid == 0 {
+		return false
+	}
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	return pidStateFromStat(b) == 'Z'
+}
+
+// pidStateFromStat returns the process state byte from a /proc/<pid>/stat
+// payload (field 3 after "pid (comm)").
+func pidStateFromStat(stat []byte) byte {
+	s := string(stat)
+	i := strings.LastIndex(s, ")")
+	if i < 0 || i+2 >= len(s) {
+		return 0
+	}
+	return s[i+2]
+}
+
+func isNotifReceiveWouldBlock(err error) bool {
+	return errors.Is(err, syscall.EAGAIN) ||
+		errors.Is(err, syscall.EWOULDBLOCK) ||
+		errors.Is(err, unix.EAGAIN) ||
+		errors.Is(err, unix.EWOULDBLOCK)
 }
 
 // Seccomp's syscall-monitor/tracer.
@@ -383,12 +448,22 @@ func (t *syscallTracer) connHandler(c *net.UnixConn) {
 	// Obtain seccomp-notification's file-descriptor and associated context.
 	pid, cntrID, fd, err := unixIpc.RecvSeccompInitMsg(c)
 	if err != nil {
+		logrus.Errorf("seccomp session: RecvSeccompInitMsg failed: %v (listener not registered — filter will ENOSYS)", err)
 		return
 	}
 
 	// Send Ack message back to sysbox-runc.
 	if err = unixIpc.SendSeccompInitAckMsg(c); err != nil {
+		logrus.Errorf("seccomp session: SendSeccompInitAckMsg failed for pid %d cntr %s: %v",
+			pid, formatter.ContainerID{cntrID}, err)
 		return
+	}
+
+	// Non-blocking receive so a stale POLLIN (cancelled notif after tracee
+	// exit) cannot wedge this session goroutine in SECCOMP_IOCTL_NOTIF_RECV.
+	if err := unix.SetNonblock(int(fd), true); err != nil {
+		logrus.Warnf("seccomp session: SetNonblock failed fd=%d pid=%d cntr=%s: %v — continuing blocking",
+			fd, pid, formatter.ContainerID{cntrID}, err)
 	}
 
 	// If needed, obtain pidfd associated to this seccomp-bfd session.
@@ -397,6 +472,14 @@ func (t *syscallTracer) connHandler(c *net.UnixConn) {
 	// Register the new seccomp-fd session.
 	session := seccompSession{uint32(pid), fd, int32(pidfd), cntrID}
 	t.seccompSessionAdd(session)
+	started := time.Now()
+
+	var (
+		inflight sync.WaitGroup
+		notifs   uint64
+		hupRetry int
+		errRetry int
+	)
 
 	for {
 		var fds []unix.PollFd
@@ -422,40 +505,119 @@ func (t *syscallTracer) connHandler(c *net.UnixConn) {
 					err, fd, pid, formatter.ContainerID{cntrID})
 				continue
 			}
-
-			logrus.Debugf("Error during Poll() execution (%v) on fd %d, pid %d, cntr %s",
+			if err == syscall.EBADF {
+				logrus.Warnf("seccomp session end: Poll EBADF on fd %d, pid %d, cntr %s notifs=%d age=%v",
+					fd, pid, formatter.ContainerID{cntrID}, notifs, time.Since(started))
+				break
+			}
+			logrus.Warnf("seccomp session: Poll error (%v) on fd %d, pid %d, cntr %s — retrying",
 				err, fd, pid, formatter.ContainerID{cntrID})
-			break
+			time.Sleep(50 * time.Millisecond)
+			continue
 		}
 
 		// As per pidfd_open(2), a pidfd becomes readable when its associated pid
-		// terminates. Exit the polling loop when this occurs.
-		if !t.seccompUnusedNotif && fds[1].Revents == unix.POLLIN {
-			logrus.Debugf("POLLIN event received on pidfd %d, pid %d, cntr %s",
-				pidfd, pid, formatter.ContainerID{cntrID})
-			break
+		// terminates. Prefer draining pending seccomp POLLIN first so we do not
+		// close the listener while notifications are still queued (ENOSYS).
+		if !t.seccompUnusedNotif && fds[1].Revents&unix.POLLIN != 0 {
+			if fds[0].Revents&unix.POLLIN == 0 {
+				logrus.Debugf("seccomp session end: pidfd ready fd=%d pidfd=%d pid=%d cntr=%s seccompRevents=0x%x notifs=%d",
+					fd, pidfd, pid, formatter.ContainerID{cntrID}, fds[0].Revents, notifs)
+				break
+			}
+			logrus.Debugf("seccomp session: pidfd ready with pending POLLIN; draining fd=%d pid=%d cntr=%s revents=0x%x",
+				fd, pid, formatter.ContainerID{cntrID}, fds[0].Revents)
 		}
 
-		// Exit the polling loop whenever the received event on the seccomp-fd is not
-		// the expected one.
-		if fds[0].Revents != unix.POLLIN {
-			logrus.Debugf("Non-POLLIN event received on fd %d, pid %d, cntr %s",
-				fd, pid, formatter.ContainerID{cntrID})
+		// Keep processing while POLLIN is set, even if POLLHUP/ERR are also set.
+		if seccompFdPollShouldBreak(fds[0].Revents) {
+			live := sessionStillLive(uint32(pid))
+			zombie := sessionIsZombie(uint32(pid))
+			isInit := false
+			if cntr := t.service.css.ContainerLookupById(cntrID); cntr != nil {
+				isInit = uint32(pid) == cntr.InitPid()
+			}
+			// Unreaped zombies still pass Kill(0); do not defer close for them.
+			if live && !zombie && hupRetry < 5 {
+				hupRetry++
+				// Non-init (docker exec) sessions often see a brief POLLHUP
+				// while the pid is still live; deferring is expected. Init
+				// premature HUP is the ENOSYS hazard — keep it loud.
+				if isInit {
+					logrus.Errorf("seccomp session: premature POLLHUP while init pid live fd=%d pid=%d cntr=%s revents=0x%x notifs=%d age=%v retry=%d — deferring close",
+						fd, pid, formatter.ContainerID{cntrID}, fds[0].Revents, notifs, time.Since(started), hupRetry)
+				} else {
+					logrus.Debugf("seccomp session: premature POLLHUP while pid live fd=%d pid=%d cntr=%s revents=0x%x notifs=%d age=%v retry=%d — deferring close",
+						fd, pid, formatter.ContainerID{cntrID}, fds[0].Revents, notifs, time.Since(started), hupRetry)
+				}
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+			if isInit || (live && notifs > 0) {
+				logrus.Errorf("seccomp session end: fd=%d pid=%d cntr=%s revents=0x%x notifs=%d age=%v live=%v isInit=%v",
+					fd, pid, formatter.ContainerID{cntrID}, fds[0].Revents, notifs, time.Since(started), live, isInit)
+			} else {
+				logrus.Debugf("seccomp session end: fd=%d pid=%d cntr=%s revents=0x%x notifs=%d age=%v",
+					fd, pid, formatter.ContainerID{cntrID}, fds[0].Revents, notifs, time.Since(started))
+			}
 			break
 		}
+		hupRetry = 0
+
+		// POLLERR/NVAL without POLLIN: retry with backoff, then exit. Leaving
+		// this unbounded hot-spins NotifReceive→EBADF on a dead fd.
+		if fds[0].Revents&unix.POLLIN == 0 &&
+			fds[0].Revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
+			errRetry++
+			if errRetry > 5 {
+				logrus.Warnf("seccomp session end: POLLERR/NVAL retries exhausted fd=%d pid=%d cntr=%s revents=0x%x notifs=%d",
+					fd, pid, formatter.ContainerID{cntrID}, fds[0].Revents, notifs)
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		errRetry = 0
 
 		// Retrieves seccomp-notification message. Notice that we will not 'break'
 		// upon error detection as libseccomp/kernel could return non-fatal errors
 		// (i.e., ENOENT) to alert of a problem with a specific notification.
 		req, err := libseccomp.NotifReceive(libseccomp.ScmpFd(fd))
 		if err != nil {
+			if isNotifReceiveWouldBlock(err) {
+				logrus.Debugf("seccomp session: NotifReceive EAGAIN fd=%d pid=%d cntr=%s (stale POLLIN)",
+					fd, pid, formatter.ContainerID{cntrID})
+				continue
+			}
 			logrus.Infof("Unexpected error during NotifReceive() execution (%v) on fd %d, pid %d, cntr %s",
 				err, fd, pid, formatter.ContainerID{cntrID})
 			continue
 		}
 
 		// Process the incoming syscall and obtain response for seccomp-tracee.
-		go t.process(req, fd, cntrID)
+		notifs++
+		inflight.Add(1)
+		go func(req *sysRequest) {
+			defer inflight.Done()
+			t.process(req, fd, cntrID)
+		}(req)
+	}
+
+	// Brief drain so in-flight NotifRespond can finish before fd close.
+	// Keep this short: a long drain under burst holds conn/goroutine/fd and
+	// amplifies load without preventing ENOSYS once the filter is released.
+	drainTimer := time.NewTimer(2 * time.Second)
+	drainDone := make(chan struct{})
+	go func() {
+		inflight.Wait()
+		close(drainDone)
+	}()
+	select {
+	case <-drainDone:
+		drainTimer.Stop()
+	case <-drainTimer.C:
+		logrus.Warnf("seccomp session drain timed out on fd %d, pid %d, cntr %s notifs=%d",
+			fd, pid, formatter.ContainerID{cntrID}, notifs)
 	}
 
 	t.seccompSessionDelete(session)
@@ -481,12 +643,17 @@ func (t *syscallTracer) process(
 
 	// Process the incoming syscall and obtain response for seccomp-tracee.
 	resp, err := t.processSyscall(req, fd, cntrID)
+	// Always answer when we have a response. Skipping NotifRespond leaves the
+	// notification outstanding until the listener fd closes → kernel ENOSYS.
+	if resp != nil {
+		if rerr := libseccomp.NotifRespond(libseccomp.ScmpFd(fd), resp); rerr != nil {
+			logrus.Debugf("NotifRespond error on fd %d pid %d cntr %s: %v",
+				fd, req.Pid, formatter.ContainerID{cntrID}, rerr)
+		}
+	}
 	if err != nil {
 		return
 	}
-
-	// Responds to a previously received seccomp-notification.
-	_ = libseccomp.NotifRespond(libseccomp.ScmpFd(fd), resp)
 }
 
 // Syscall processing entrypoint. Returns the response to be delivered to the
