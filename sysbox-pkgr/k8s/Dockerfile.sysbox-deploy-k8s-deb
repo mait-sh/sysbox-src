@@ -1,0 +1,75 @@
+#
+# sysbox-deploy-k8s rebuilt from the Sysbox .deb package built by sysbox-pkgr.
+#
+# Still FROM the last upstream-published image for CRI-O / shiftfs scaffolding
+# (a full rebuild via Dockerfile.sysbox-ce needs patched crio/pinns binaries
+# that are not reproduced here). This image replaces:
+#   1. /opt/sysbox/bin/generic/{sysbox-mgr,sysbox-fs,sysbox-runc} from the .deb
+#   2. /opt/sysbox/scripts/sysbox-deploy-k8s.sh (Kubernetes version check and
+#      fusermount3 AppArmor local override, as in the package scripts)
+#
+# Build context must include packages/ with the matching arch .deb: either
+# the release package packages/<SYSBOX_DEB_PREFIX>-<arch>-<version>.deb (the
+# name prefix is a build argument) or the upstream name
+# packages/sysbox-ce_<ver>.linux_<arch>.deb.
+#
+# Example (from this directory):
+#
+#   docker build -f Dockerfile.sysbox-deploy-k8s-deb \
+#       --build-arg TARGETARCH=amd64 \
+#       --build-arg SYSBOX_VERSION=<version> \
+#       --build-arg SYSBOX_DEB_PREFIX=<prefix> \
+#       -t <registry>/sysbox-deploy-k8s:<version> .
+#
+# OCI tags use '-' where the package version uses '+'.
+#
+
+ARG TARGETARCH=amd64
+ARG SYSBOX_VERSION
+# Name prefix of the release .deb in packages/: <prefix>-<arch>-<version>.deb.
+ARG SYSBOX_DEB_PREFIX=sysbox-deb-linux
+
+# ── Extract the packaged Sysbox binaries (source of truth for node install) ──
+FROM ubuntu:24.04 AS sysbox-pkg
+ARG TARGETARCH
+ARG SYSBOX_DEB_PREFIX
+COPY packages/ /tmp/packages/
+RUN set -eux; \
+    mkdir -p /extract /out/packages; \
+    deb="$(ls /tmp/packages/${SYSBOX_DEB_PREFIX}-${TARGETARCH}-*.deb 2>/dev/null | head -1 || true)"; \
+    if [ -z "$deb" ]; then \
+      deb="$(ls /tmp/packages/sysbox-ce_*.linux_${TARGETARCH}.deb 2>/dev/null | head -1 || true)"; \
+    fi; \
+    if [ -z "$deb" ]; then \
+      echo "ERROR: no Sysbox .deb for arch ${TARGETARCH} under packages/" >&2; \
+      echo "       Expected ${SYSBOX_DEB_PREFIX}-${TARGETARCH}-<ver>.deb" >&2; \
+      echo "       or sysbox-ce_<ver>.linux_${TARGETARCH}.deb" >&2; \
+      ls -la /tmp/packages/ >&2 || true; \
+      exit 1; \
+    fi; \
+    echo "Extracting $deb"; \
+    dpkg-deb -x "$deb" /extract; \
+    test -x /extract/usr/bin/sysbox-runc; \
+    test -x /extract/usr/bin/sysbox-mgr; \
+    test -x /extract/usr/bin/sysbox-fs; \
+    cp "$deb" /out/packages/
+
+# ── Layer over last upstream-published deploy image ──────────────────────────
+FROM registry.nestybox.com/nestybox/sysbox-deploy-k8s:v0.7.0-0
+
+ARG SYSBOX_VERSION
+# Deploy script reads SYSBOX_VERSION (appends -0 when no patch segment).
+ENV SYSBOX_VERSION=${SYSBOX_VERSION}
+
+# The packaged binaries replace the upstream v0.7.0-0 payload for the generic
+# (Ubuntu/Debian) artifacts dir used by copy_sysbox_to_host.
+COPY --from=sysbox-pkg /extract/usr/bin/sysbox-mgr  /opt/sysbox/bin/generic/sysbox-mgr
+COPY --from=sysbox-pkg /extract/usr/bin/sysbox-fs   /opt/sysbox/bin/generic/sysbox-fs
+COPY --from=sysbox-pkg /extract/usr/bin/sysbox-runc /opt/sysbox/bin/generic/sysbox-runc
+
+# Keep the exact package byte-identical for provenance / debugging.
+COPY --from=sysbox-pkg /out/packages/ /opt/sysbox/packages/
+
+# Installer script: Kubernetes version check + fusermount3 AppArmor override.
+# Mode/ownership match upstream (0775, root:root).
+COPY --chmod=0775 scripts/sysbox-deploy-k8s.sh /opt/sysbox/scripts/sysbox-deploy-k8s.sh
