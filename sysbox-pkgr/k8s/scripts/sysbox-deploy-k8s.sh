@@ -855,10 +855,18 @@ function is_supported_k8s_version() {
 
 	local ver=$k8s_version
 
-	if [[ "$ver" == "v1.32" ]] ||
-		[[ "$ver" == "v1.33" ]] ||
-		[[ "$ver" == "v1.34" ]] ||
-		[[ "$ver" == "v1.35" ]] ; then
+	# Upstream enumerated v1.32..v1.35 here, so every new
+	# Kubernetes minor release was hard-rejected until someone hand-edited
+	# this list -- v1.36 (the current k3s stable channel) crash-loops the
+	# DaemonSet with "Sysbox is not supported on this Kubernetes version".
+	# Reported upstream as nestybox/sysbox#1036 (unacknowledged). Replace the
+	# enumeration with a numeric floor on the minor version so newer releases
+	# are accepted by default; the EOL-rejection block below is unchanged, so
+	# v1.19..v1.31 still fail exactly as before.
+	local -r min_supported_minor=32
+
+	if [[ "$ver" =~ ^v1\.([0-9]+)$ ]] &&
+		((BASH_REMATCH[1] >= min_supported_minor)); then
 		return
 	fi
 
