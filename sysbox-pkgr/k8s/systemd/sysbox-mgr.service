@@ -8,6 +8,9 @@ Type=notify
 ExecStart=/usr/bin/sysbox-mgr --disable-inner-image-preload
 TimeoutStartSec=45
 TimeoutStopSec=90
+# Keep mgr alive across process crashes (pairs with sysbox-fs).
+Restart=always
+RestartSec=2
 StartLimitInterval=0
 NotifyAccess=main
 OOMScoreAdjust=-500
