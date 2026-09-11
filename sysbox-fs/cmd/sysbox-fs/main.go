@@ -230,6 +230,11 @@ func main() {
 			Usage:  "enable memory-profiling data collection",
 			Hidden: true,
 		},
+		cli.StringFlag{
+			Name:  "nsenter-breaker",
+			Value: "on",
+			Usage: "Per-container nsenter hard-timeout circuit breaker (on/off; default on)",
+		},
 	}
 
 	// show-version specialization.
@@ -419,6 +424,7 @@ func main() {
 			ctx.BoolT("allow-immutable-remounts"),
 			ctx.Bool("allow-immutable-unmounts"),
 			ctx.GlobalString("seccomp-fd-release"),
+			ctx.GlobalString("nsenter-breaker"),
 		)
 
 		ipcService.Setup(

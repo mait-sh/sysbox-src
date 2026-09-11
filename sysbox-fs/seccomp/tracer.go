@@ -79,6 +79,7 @@ type SyscallMonitorService struct {
 	allowImmutableRemounts bool                              // allow immutable mounts to be remounted
 	allowImmutableUnmounts bool                              // allow immutable mounts to be unmounted
 	closeSeccompOnContExit bool                              // close seccomp fds on container exit, not on process exit
+	nsenterBreakerEnabled  bool                              // nsenter timeout circuit breaker
 	tracer                 *syscallTracer                    // pointer to actual syscall-tracer instance
 }
 
@@ -93,7 +94,8 @@ func (scs *SyscallMonitorService) Setup(
 	mts domain.MountServiceIface,
 	allowImmutableRemounts bool,
 	allowImmutableUnmounts bool,
-	seccompFdReleasePolicy string) {
+	seccompFdReleasePolicy string,
+	nsenterBreaker string) {
 
 	scs.nss = nss
 	scs.css = css
@@ -101,6 +103,8 @@ func (scs *SyscallMonitorService) Setup(
 	scs.mts = mts
 	scs.allowImmutableRemounts = allowImmutableRemounts
 	scs.allowImmutableUnmounts = allowImmutableUnmounts
+	// Default on; only "off" disables the breaker.
+	scs.nsenterBreakerEnabled = nsenterBreaker != "off"
 
 	if seccompFdReleasePolicy == "cont-exit" {
 		scs.closeSeccompOnContExit = true
@@ -140,6 +144,7 @@ type syscallTracer struct {
 	seccompSessionMu   sync.RWMutex                      // seccomp session table lock
 	seccompUnusedNotif bool                              // seccomp-fd unused notification feature supported by kernel
 	seccompNotifPidTrk *seccompNotifPidTracker           // Ensures seccomp notifs for the same pid are processed sequentially (not in parallel).
+	nsenterBreaker     *nsenterBreaker                   // per-container hard-timeout circuit breaker
 	service            *SyscallMonitorService            // backpointer to syscall-monitor service
 }
 
@@ -162,8 +167,9 @@ func getSupportedCompatibleSyscalls(nativeArchId libseccomp.ScmpArch) map[libsec
 func newSyscallTracer(sms *SyscallMonitorService) *syscallTracer {
 
 	tracer := &syscallTracer{
-		service:  sms,
-		syscalls: make(map[seccompArchSyscallPair]string),
+		service:        sms,
+		syscalls:       make(map[seccompArchSyscallPair]string),
+		nsenterBreaker: newNsenterBreaker(sms.nsenterBreakerEnabled),
 	}
 
 	if sms.closeSeccompOnContExit {
@@ -467,6 +473,12 @@ func (t *syscallTracer) process(
 	t.seccompNotifPidTrk.Lock(req.Pid)
 	defer t.seccompNotifPidTrk.Unlock(req.Pid)
 
+	// An open breaker short-circuits mediation with EIO.
+	if t.nsenterBreaker != nil && !t.nsenterBreaker.allow(cntrID) {
+		_ = libseccomp.NotifRespond(libseccomp.ScmpFd(fd), t.createErrorResponse(req.ID, syscall.EIO))
+		return
+	}
+
 	// Process the incoming syscall and obtain response for seccomp-tracee.
 	resp, err := t.processSyscall(req, fd, cntrID)
 	if err != nil {
@@ -572,6 +584,9 @@ func (t *syscallTracer) processSyscall(
 		if errors.Is(err, domain.ErrNsenterTimeout) {
 			logrus.Errorf("nsenter timeout during syscall %v processing on fd %d, pid %d, req Id %d, cntr %s (%v)",
 				syscallName, fd, req.Pid, req.ID, formatter.ContainerID{cntrID}, err)
+			if t.nsenterBreaker != nil {
+				t.nsenterBreaker.recordTimeout(cntrID)
+			}
 			return t.createErrorResponse(req.ID, syscall.EIO), nil
 		}
 		logrus.Warnf("Error during syscall %v processing on fd %d, pid %d, req Id %d, cntr %s (%v)",
@@ -584,6 +599,10 @@ func (t *syscallTracer) processSyscall(
 		logrus.Debugf("TOCTOU check failed on fd %d pid %d cntr %s: req.ID %d is no longer valid (%s)",
 			fd, req.Pid, formatter.ContainerID{cntrID}, req.ID, err)
 		return t.createErrorResponse(req.ID, err), fmt.Errorf("TOCTOU error")
+	}
+
+	if t.nsenterBreaker != nil {
+		t.nsenterBreaker.recordSuccess(cntrID)
 	}
 
 	return resp, nil

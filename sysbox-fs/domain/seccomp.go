@@ -23,5 +23,7 @@ type SyscallMonitorServiceIface interface {
 		prs ProcessServiceIface,
 		mts MountServiceIface,
 		allowImmutableRemounts bool,
-		allowImmutableUnmounts bool)
+		allowImmutableUnmounts bool,
+		seccompFdReleasePolicy string,
+		nsenterBreaker string)
 }
