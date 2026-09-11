@@ -16,6 +16,14 @@
 
 package domain
 
+import "errors"
+
+// ErrNsenterTimeout is returned when an nsenter agent fails to answer within
+// the configured SO_RCVTIMEO budget. Callers (seccomp) map this to EIO so the
+// failure is distinguishable from EINVAL (handler error) and ENOSYS
+// (mediation gone). Continues the sysbox-fs#121 / nestybox/sysbox#1018 line.
+var ErrNsenterTimeout = errors.New("nsenter response wait timed out")
+
 // Aliases to leverage strong-typing.
 type NStype = string
 type NSenterMsgType = string

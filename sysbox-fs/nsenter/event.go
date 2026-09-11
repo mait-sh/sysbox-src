@@ -149,10 +149,23 @@ func (e *NSenterEvent) getRespFileDescriptors(pipe *os.File) ([]int, error) {
 	oob := make([]byte, getOobBufferSize())
 
 	// Recvmsg will unblock when the nsenter agent sends the file descriptor(s),
-	// if it dies, or if the timeout expires. If the nsenter agent has no file
+	// if it dies, or if SO_RCVTIMEO expires. If the nsenter agent has no file
 	// descriptors to send, it will send a zero-length SCM_RIGHTS message.
-	_, oobn, _, _, err := unix.Recvmsg(int(pipe.Fd()), nil, oob, 0)
-	if err != nil {
+	// Retry on EINTR (signals / Go runtime preemption can interrupt the syscall
+	// without consuming the SO_RCVTIMEO budget).
+	var oobn int
+	var err error
+	for {
+		_, oobn, _, _, err = unix.Recvmsg(int(pipe.Fd()), nil, oob, 0)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, unix.EINTR) || errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if wrapped := wrapSockTimeout(err); errors.Is(wrapped, domain.ErrNsenterTimeout) {
+			return nil, wrapped
+		}
 		logrus.Warnf("failed to receive fd(s) via SCM_RIGHTS: %v", err)
 		return nil, fmt.Errorf("error receiving fd via SCM_RIGHTS: %v", err)
 	}
@@ -206,6 +219,9 @@ func (e *NSenterEvent) processResponse(pipe *os.File) error {
 	// remote-end. This second step is executed as part of a subsequent
 	// unmarshal instruction (see further below).
 	if err := json.NewDecoder(pipe).Decode(&nsenterMsg); err != nil {
+		if wrapped := wrapSockTimeout(err); errors.Is(wrapped, domain.ErrNsenterTimeout) {
+			return wrapped
+		}
 		logrus.Warnf("Error decoding received nsenterMsg response: %s", err)
 		return fmt.Errorf("decoding received nsenterMsg response: %s", err)
 	}
@@ -560,7 +576,30 @@ func (e *NSenterEvent) namespacePaths() []string {
 // Sysbox-fs nsenter requests are generated through this method. Handlers seeking to
 // access namespaced resources will call this method to dispatch an nsenter agent,
 // which will enter the container namespaces to perform the requested operations.
+//
+// Continues sysbox-fs#121 (a52a911): PARENT/CHILD Process.Wait remain async so a
+// fuse_flush-delayed exit cannot hold the reaper RLock. This method additionally
+// bounds the grand-child response wait with SO_RCVTIMEO (SetReadDeadline is a
+// no-op after Fd() detaches the socket from the Go poller) and kills+reaps the
+// agent on hard timeout so nestybox/sysbox#1018-class wedges cannot permanently
+// stall mediation.
 func (e *NSenterEvent) SendRequest() error {
+	err := e.sendRequestOnce()
+	if err == nil || e.ReqMsg == nil || !idempotentRequest(e.ReqMsg.Type) {
+		return err
+	}
+	if !errors.Is(err, domain.ErrNsenterTimeout) {
+		return err
+	}
+	logrus.Warnf("nsenter idempotent request %s timed out; retrying once (pid %d)",
+		e.ReqMsg.Type, e.Pid)
+	e.Process = nil
+	e.parentPipe = nil
+	e.ResMsg = nil
+	return e.sendRequestOnce()
+}
+
+func (e *NSenterEvent) sendRequestOnce() error {
 
 	logrus.Debug("Executing nsenterEvent's SendRequest() method")
 
@@ -595,6 +634,14 @@ func (e *NSenterEvent) SendRequest() error {
 		return fmt.Errorf("Error setting socket options on nsenter pipe: %v", err)
 	}
 
+	// Bound every subsequent read on this socket (first-child pid handshake and
+	// processResponse). Fd() above detached the descriptor from Go's poller, so
+	// SetReadDeadline cannot work; SO_RCVTIMEO does. Start with the fast budget
+	// so a wedged handshake cannot wait the full mount deadline.
+	if err := setSockTimeouts(socket, nsenterTimeoutFast, nsenterTimeoutFast); err != nil {
+		return fmt.Errorf("Error setting nsenter socket timeouts: %v", err)
+	}
+
 	// Create the nsenter instruction packet
 	r := nl.NewNetlinkRequest(int(libcontainer.InitMsg), 0)
 
@@ -612,11 +659,20 @@ func (e *NSenterEvent) SendRequest() error {
 	})
 
 	// Prepare exec.cmd in charge of running: "sysbox-fs nsenter".
+	agentEnv := []string{
+		"_LIBCONTAINER_INITPIPE=3",
+		fmt.Sprintf("GOMAXPROCS=%s", os.Getenv("GOMAXPROCS")),
+	}
+	// Fault-inject env must reach the nsenter agent (hang tests). The agent
+	// process does not inherit the daemon environment by default.
+	if v := os.Getenv("SYSBOX_FS_TEST_HANG_MOUNT"); v != "" {
+		agentEnv = append(agentEnv, "SYSBOX_FS_TEST_HANG_MOUNT="+v)
+	}
 	cmd := &exec.Cmd{
 		Path:        "/proc/self/exe",
 		Args:        []string{os.Args[0], "nsenter"},
 		ExtraFiles:  []*os.File{childPipe},
-		Env:         []string{"_LIBCONTAINER_INITPIPE=3", fmt.Sprintf("GOMAXPROCS=%s", os.Getenv("GOMAXPROCS"))},
+		Env:         agentEnv,
 		SysProcAttr: &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM},
 		Stdin:       nil,
 		Stdout:      nil,
@@ -647,6 +703,13 @@ func (e *NSenterEvent) SendRequest() error {
 	var pid pid
 	decoder := json.NewDecoder(e.parentPipe)
 	if err := decoder.Decode(&pid); err != nil {
+		if wrapped := wrapSockTimeout(err); errors.Is(wrapped, domain.ErrNsenterTimeout) {
+			logrus.Warnf("nsenter first-child pid handshake timed out: %v", wrapped)
+			if !e.Async {
+				e.reaper.nsenterReapReq()
+			}
+			return wrapped
+		}
 		logrus.Warnf("Error receiving first-child pid: %s", err)
 		if !e.Async {
 			e.reaper.nsenterReapReq()
@@ -722,15 +785,78 @@ func (e *NSenterEvent) SendRequest() error {
 		return nil
 	}
 
+	// Re-apply the response budget for this request class (mount/umount = slow).
+	budget := e.responseBudget()
+	logrus.Infof("nsenter response wait budget=%v req=%v timeoutDisable=%q slowMs=%q",
+		budget,
+		func() domain.NSenterMsgType {
+			if e.ReqMsg == nil {
+				return "<nil>"
+			}
+			return e.ReqMsg.Type
+		}(),
+		os.Getenv("SYSBOX_FS_NSENTER_TIMEOUT_DISABLE"),
+		os.Getenv("SYSBOX_FS_NSENTER_TIMEOUT_SLOW_MS"),
+	)
+	if err := setSockTimeouts(socket, budget, budget); err != nil {
+		logrus.Warnf("Error re-applying nsenter response budget: %v", err)
+	}
+	// Belt-and-braces: ignored today (Fd() made deadlines inert); becomes live
+	// if a future Go keeps the fd pollable.
+	_ = e.parentPipe.SetReadDeadline(time.Now().Add(budget))
+
+	started := time.Now()
+	soft := e.softWarnBudget()
+	var softTimer *time.Timer
+	if soft > 0 {
+		agentPid := 0
+		if e.Process != nil {
+			agentPid = e.Process.Pid
+		}
+		reqType := domain.NSenterMsgType("<nil>")
+		if e.ReqMsg != nil {
+			reqType = e.ReqMsg.Type
+		}
+		softTimer = time.AfterFunc(soft, func() {
+			logrus.Warnf("nsenter soft-warn: req=%s tracee=%d agent=%s elapsed>%v",
+				reqType, e.Pid, captureAgentState(agentPid), soft)
+		})
+		defer softTimer.Stop()
+	}
+
 	// Wait for sysbox-fs' grand-child response and process it accordingly.
 	ierr := e.processResponse(e.parentPipe)
 
 	// Destroy the socket pair.
-	if err := unix.Shutdown(int(parentPipe.Fd()), unix.SHUT_WR); err != nil {
+	if err := unix.Shutdown(int(parentPipe.Fd()), unix.SHUT_RDWR); err != nil {
 		logrus.Warnf("Error shutting down sysbox-fs nsenter pipe: %s", err)
 	}
 
 	if ierr != nil {
+		if errors.Is(ierr, domain.ErrNsenterTimeout) {
+			reqType := domain.NSenterMsgType("<nil>")
+			if e.ReqMsg != nil {
+				reqType = e.ReqMsg.Type
+			}
+			agentPid := 0
+			if e.Process != nil {
+				agentPid = e.Process.Pid
+			}
+			logrus.Errorf("nsenter hard-timeout: req=%s tracee=%d budget=%v elapsed=%v agent=%s",
+				reqType, e.Pid, budget, time.Since(started), captureAgentState(agentPid))
+			if e.Process != nil {
+				if kerr := e.Process.Kill(); kerr != nil && !errors.Is(kerr, os.ErrProcessDone) {
+					// ESRCH is fine (already exited); anything else is worth a warn.
+					if !errors.Is(kerr, syscall.ESRCH) {
+						logrus.Warnf("nsenter hard-timeout: kill agent pid %d: %v", agentPid, kerr)
+					}
+				}
+				e.reaper.reapProcessAsync(e.Process)
+			} else {
+				e.reaper.nsenterReapReq()
+			}
+			return ierr
+		}
 		e.reaper.nsenterReapReq()
 		return ierr
 	}
@@ -1115,6 +1241,7 @@ func (e *NSenterEvent) processMountSyscallRequest() error {
 
 	// Perform mount instructions.
 	for i = 0; i < len(payload); i++ {
+		maybeHangMountForTest(payload[i].Target)
 		err = unix.Mount(
 			payload[i].Source,
 			payload[i].Target,
@@ -1994,6 +2121,8 @@ func Init() (err error) {
 	var (
 		pipefd      int
 		envInitPipe = os.Getenv("_LIBCONTAINER_INITPIPE")
+		// Preserve fault-inject hang env across Clearenv (hang tests).
+		hangMount = os.Getenv("SYSBOX_FS_TEST_HANG_MOUNT")
 	)
 
 	// Get the INITPIPE.
@@ -2009,6 +2138,9 @@ func Init() (err error) {
 	// Clear the current process's environment to clean any libcontainer
 	// specific env vars.
 	os.Clearenv()
+	if hangMount != "" {
+		_ = os.Setenv("SYSBOX_FS_TEST_HANG_MOUNT", hangMount)
+	}
 
 	// Setup nsenterService and its dependencies.
 	var nsenterSvc = NewNSenterService()

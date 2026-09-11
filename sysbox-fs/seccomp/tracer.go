@@ -19,6 +19,7 @@ package seccomp
 import (
 	"C"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"path/filepath"
@@ -563,7 +564,16 @@ func (t *syscallTracer) processSyscall(
 	// errors we are referring to problems beyond the end-user realm: EPERM
 	// error during Open() doesn't qualify, whereas 'nsenter' operational
 	// errors or inexistent "/proc/pid/mem" does.
+	//
+	// ErrNsenterTimeout is special-cased to EIO so it stays distinguishable
+	// from status-quo EINVAL (handler failure) and mediation-gone ENOSYS
+	// (seccomp listener gone). See nestybox/sysbox#1018.
 	if err != nil {
+		if errors.Is(err, domain.ErrNsenterTimeout) {
+			logrus.Errorf("nsenter timeout during syscall %v processing on fd %d, pid %d, req Id %d, cntr %s (%v)",
+				syscallName, fd, req.Pid, req.ID, formatter.ContainerID{cntrID}, err)
+			return t.createErrorResponse(req.ID, syscall.EIO), nil
+		}
 		logrus.Warnf("Error during syscall %v processing on fd %d, pid %d, req Id %d, cntr %s (%v)",
 			syscallName, fd, req.Pid, req.ID, formatter.ContainerID{cntrID}, err)
 		return t.createErrorResponse(req.ID, syscall.EINVAL), nil
