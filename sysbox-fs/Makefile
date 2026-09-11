@@ -3,7 +3,7 @@
 #
 # Note: targets must execute from the $SYSFS_DIR
 
-.PHONY: clean sysbox-fs-debug sysbox-fs-static lint list-packages
+.PHONY: clean sysbox-fs-debug sysbox-fs-static lint list-packages fuse-abort
 
 GO := go
 
@@ -71,6 +71,12 @@ $(SYSFS_BUILDDIR)/$(SYSFS_STATIC_TARGET): $(SYSFS_SRC) $(SYSFS_GRPC_SRC) $(SYSLI
 	CGO_ENABLED=1 $(GO_XCOMPILE) $(GO) build -buildvcs=false -trimpath -tags "netgo osusergo" \
 		-installsuffix netgo -ldflags "-extldflags -static ${LDFLAGS}" \
 		-o $(SYSFS_BUILDDIR)/sysbox-fs ./cmd/sysbox-fs
+
+fuse-abort: $(SYSFS_BUILDDIR)/fuse-abort
+
+$(SYSFS_BUILDDIR)/fuse-abort: bazil/cmd/fuse-abort/main.go
+	mkdir -p $(SYSFS_BUILDDIR)
+	$(GO_XCOMPILE) $(GO) build -buildvcs=false -trimpath -o $(SYSFS_BUILDDIR)/fuse-abort ./bazil/cmd/fuse-abort
 
 gomod-tidy:
 	$(GO) mod tidy

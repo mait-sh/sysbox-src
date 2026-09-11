@@ -18,6 +18,7 @@ package fuse
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 
@@ -43,7 +44,9 @@ type fuseServer struct {
 	nodeDB       map[string]*bfusefs.Node // map to store all fs nodes, e.g. "/proc/uptime" -> File
 	root         *Dir                     // root node of fuse fs -- "/" by default
 	initDone     chan bool                // sync-up channel to alert about fuse-server's init-completion
+	runDone      chan struct{}            // closed when Run() returns (supervisor wait)
 	cntrReg      bool                     // flag to track the container's registration state
+	stopping     bool                     // true when DestroyFuseServer requested teardown (no respawn)
 	service      *FuseServerService       // backpointer to parent service
 }
 
@@ -115,12 +118,16 @@ func (s *fuseServer) Create() error {
 	// Initialize pending members.
 	s.nodeDB = make(map[string]*bfusefs.Node)
 	s.initDone = make(chan bool)
+	s.runDone = make(chan struct{})
 
 	return nil
 }
 
 func (s *fuseServer) Run() error {
-	defer close(s.initDone)
+	defer func() {
+		close(s.initDone)
+		close(s.runDone)
+	}()
 	//
 	// Creating a FUSE mount at the associated mountpoint.
 	//
@@ -151,15 +158,17 @@ func (s *fuseServer) Run() error {
 	}()
 
 	if p := c.Protocol(); !p.HasInvalidate() {
-		logrus.Panic("Kernel FUSE support is too old to have invalidations: version ", p)
+		err := fmt.Errorf("kernel FUSE support is too old to have invalidations: version %v", p)
+		logrus.Error(err)
 		return err
 	}
 
 	// Creating a FUSE server to drive kernel interactions.
 	s.server = bfusefs.New(c, nil)
 	if s.server == nil {
-		logrus.Panic("FUSE file-system could not be created")
-		return errors.New("FUSE file-system could not be created")
+		err := errors.New("FUSE file-system could not be created")
+		logrus.Error(err)
+		return err
 	}
 
 	// At this point we are done with fuse-server initialization, so let's
@@ -168,7 +177,7 @@ func (s *fuseServer) Run() error {
 
 	// Launch fuse-server's main-loop to handle incoming requests.
 	if err := s.server.Serve(s); err != nil {
-		logrus.Panic(err)
+		logrus.Errorf("FUSE server Serve exited: %v", err)
 		return err
 	}
 

@@ -845,6 +845,7 @@ func (e *NSenterEvent) sendRequestOnce() error {
 			logrus.Errorf("nsenter hard-timeout: req=%s tracee=%d budget=%v elapsed=%v agent=%s",
 				reqType, e.Pid, budget, time.Since(started), captureAgentState(agentPid))
 			if e.Process != nil {
+				registerLeakedAgent(agentPid)
 				if kerr := e.Process.Kill(); kerr != nil && !errors.Is(kerr, os.ErrProcessDone) {
 					// ESRCH is fine (already exited); anything else is worth a warn.
 					if !errors.Is(kerr, syscall.ESRCH) {

@@ -235,6 +235,10 @@ func main() {
 			Value: "on",
 			Usage: "Per-container nsenter hard-timeout circuit breaker (on/off; default on)",
 		},
+		cli.BoolFlag{
+			Name:  "nsenter-timeout-abort-fuse",
+			Usage: "If set, leaked-agent sweeper auto-aborts FUSE connections for agents stuck in fuse_* (default: false)",
+		},
 	}
 
 	// show-version specialization.
@@ -415,6 +419,8 @@ func main() {
 			processService,
 			nsenterService,
 		)
+
+		nsenter.SetNsenterTimeoutAbortFuse(ctx.Bool("nsenter-timeout-abort-fuse"))
 
 		syscallMonitorService.Setup(
 			nsenterService,

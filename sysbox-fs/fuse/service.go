@@ -21,12 +21,23 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	_ "bazil.org/fuse/fs/fstestutil"
 
 	"github.com/nestybox/sysbox-fs/domain"
 	"github.com/sirupsen/logrus"
 )
+
+// Default FUSE respawn policy. Exported for unit tests.
+var DefaultFuseRespawnBackoffs = []time.Duration{
+	1 * time.Second,
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+}
+
+const DefaultFuseRespawnMaxAttempts = 5
 
 type FuseServerService struct {
 	sync.RWMutex                                   // servers map protection
@@ -85,7 +96,7 @@ func (fss *FuseServerService) DestroyFuseService() {
 //
 // Normally serveCntr and stateCntr refer to the same cntr object. However, if
 // multiple containers want to share the same fuse state (as sysbox-fs does for
-// kubernetes pods), then this function may be called with different serveCntr
+// namespaces pods), then this function may be called with different serveCntr
 // objects but the same stateCntr object.
 func (fss *FuseServerService) CreateFuseServer(serveCntr, stateCntr domain.ContainerIface) error {
 
@@ -101,36 +112,17 @@ func (fss *FuseServerService) CreateFuseServer(serveCntr, stateCntr domain.Conta
 	}
 	fss.RUnlock()
 
-	// Create required mountpoint in host file-system.
-	cntrMountpoint := filepath.Join(fss.mountPoint, cntrId)
-	mountpointIOnode := fss.ios.NewIOnode("", cntrMountpoint, 0600)
-	if err := mountpointIOnode.MkdirAll(); err != nil {
-		return errors.New("FuseServer with invalid mountpoint")
+	srv, err := fss.createAndStartServer(cntrId, stateCntr)
+	if err != nil {
+		return err
 	}
 
-	srv := NewFuseServer(
-		"/",
-		cntrMountpoint,
-		stateCntr,
-		fss,
-	)
-
-	// Create new fuse-server.
-	if err := srv.Create(); err != nil {
-		return errors.New("FuseServer initialization error")
-	}
-
-	// Launch fuse-server in a separate goroutine and wait for 'ack' before
-	// moving on.
-	go srv.Run()
-	if !srv.InitWait() {
-		return errors.New("FuseServer InitWait error")
-	}
-
-	// Store newly created fuse-server.
+	// Store newly created fuse-server and supervise Run() for unexpected exit.
 	fss.Lock()
-	fss.serversMap[cntrId] = srv.(*fuseServer)
+	fss.serversMap[cntrId] = srv
 	fss.Unlock()
+
+	go fss.superviseFuseServer(cntrId, srv, serveCntr, stateCntr)
 
 	logrus.Debugf("Created fuse server for container %s", cntrId)
 
@@ -139,6 +131,111 @@ func (fss *FuseServerService) CreateFuseServer(serveCntr, stateCntr domain.Conta
 	}
 
 	return nil
+}
+
+func (fss *FuseServerService) createAndStartServer(cntrId string, stateCntr domain.ContainerIface) (*fuseServer, error) {
+	// Create required mountpoint in host file-system.
+	cntrMountpoint := filepath.Join(fss.mountPoint, cntrId)
+	mountpointIOnode := fss.ios.NewIOnode("", cntrMountpoint, 0600)
+	if err := mountpointIOnode.MkdirAll(); err != nil {
+		return nil, errors.New("FuseServer with invalid mountpoint")
+	}
+
+	iface := NewFuseServer(
+		"/",
+		cntrMountpoint,
+		stateCntr,
+		fss,
+	)
+	srv := iface.(*fuseServer)
+
+	if err := srv.Create(); err != nil {
+		return nil, errors.New("FuseServer initialization error")
+	}
+
+	go func() {
+		_ = srv.Run()
+	}()
+	if !srv.InitWait() {
+		return nil, errors.New("FuseServer InitWait error")
+	}
+	return srv, nil
+}
+
+// fuseRespawnPlan returns how long to sleep before respawn attempt
+// (0-based). Factorable for unit tests without a real FUSE mount.
+func fuseRespawnPlan(attempt int, backoffs []time.Duration, maxAttempts int) (wait time.Duration, giveUp bool) {
+	if attempt < 0 || attempt >= maxAttempts {
+		return 0, true
+	}
+	if attempt == 0 || len(backoffs) == 0 {
+		return 0, false
+	}
+	idx := attempt - 1
+	if idx >= len(backoffs) {
+		return backoffs[len(backoffs)-1], false
+	}
+	return backoffs[idx], false
+}
+
+func (fss *FuseServerService) superviseFuseServer(
+	cntrId string,
+	srv *fuseServer,
+	serveCntr, stateCntr domain.ContainerIface) {
+
+	<-srv.runDone
+
+	srv.RLock()
+	stopping := srv.stopping
+	srv.RUnlock()
+	if stopping {
+		return
+	}
+
+	logrus.Errorf("sysbox-fs: FUSE server exited unexpectedly for container %s; aborting and respawning", cntrId)
+	if err := srv.Abort(); err != nil {
+		logrus.Warnf("sysbox-fs: FUSE abort for container %s: %v", cntrId, err)
+	}
+
+	fss.Lock()
+	if cur, ok := fss.serversMap[cntrId]; ok && cur == srv {
+		delete(fss.serversMap, cntrId)
+	}
+	fss.Unlock()
+
+	for attempt := 0; attempt < DefaultFuseRespawnMaxAttempts; attempt++ {
+		wait, giveUp := fuseRespawnPlan(attempt, DefaultFuseRespawnBackoffs, DefaultFuseRespawnMaxAttempts)
+		if giveUp {
+			break
+		}
+		if wait > 0 {
+			time.Sleep(wait)
+		}
+
+		fss.RLock()
+		_, exists := fss.serversMap[cntrId]
+		fss.RUnlock()
+		if exists {
+			return
+		}
+
+		newSrv, err := fss.createAndStartServer(cntrId, stateCntr)
+		if err != nil {
+			logrus.Errorf("sysbox-fs: FUSE respawn attempt %d/%d for container %s failed: %v",
+				attempt+1, DefaultFuseRespawnMaxAttempts, cntrId, err)
+			continue
+		}
+
+		fss.Lock()
+		fss.serversMap[cntrId] = newSrv
+		fss.Unlock()
+		go fss.superviseFuseServer(cntrId, newSrv, serveCntr, stateCntr)
+		logrus.Infof("sysbox-fs: FUSE server respawned for container %s (attempt %d)", cntrId, attempt+1)
+		return
+	}
+
+	logrus.Errorf("sysbox-fs: FUSE server respawn gave up for container %s after %d attempts",
+		cntrId, DefaultFuseRespawnMaxAttempts)
 }
 
 // Destroy a fuse-server.
@@ -154,6 +251,11 @@ func (fss *FuseServerService) DestroyFuseServer(cntrId string) error {
 		return nil
 	}
 	fss.RUnlock()
+
+	// Mark stopping so the supervisor does not respawn.
+	srv.Lock()
+	srv.stopping = true
+	srv.Unlock()
 
 	// Destroy fuse-server.
 	if err := srv.Destroy(); err != nil {
