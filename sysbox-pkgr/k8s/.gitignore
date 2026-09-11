@@ -1,2 +1,4 @@
 bin/*
 !bin/README.md
+packages/*
+!packages/README.md

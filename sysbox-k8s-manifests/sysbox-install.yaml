@@ -63,7 +63,15 @@ spec:
         effect: "NoSchedule"
       containers:
       - name: sysbox-deploy-k8s
-        image: registry.nestybox.com/nestybox/sysbox-deploy-k8s:v0.7.0-0
+        # Image rebuilt from the Sysbox .deb built by sysbox-pkgr (same
+        # version as the packages) via the Dockerfile in
+        # sysbox-pkgr/k8s.
+        # Still layers on upstream v0.7.0-0 for CRI-O/shiftfs scaffolding
+        # (nestybox never shipped a v0.7.1 deploy image — #1038). Tag must
+        # stay aligned with the package release (bump on publish).
+        # Generic image name: the distributor sets the registry and tag
+        # of the image it publishes.
+        image: sysbox-deploy-k8s:0.7.1-fork.g0b45495
         imagePullPolicy: Always
         command: [ "bash", "-c", "/opt/sysbox/scripts/sysbox-deploy-k8s.sh ce install" ]
         env:
