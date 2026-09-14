@@ -69,6 +69,42 @@ create_sysboxfs_mountpoint() {
     fi
 }
 
+# fusermount3 AppArmor local override for sysbox-fs
+# mounts under /var/lib/sysboxfs (AppArmor "failed mntpnt match"). Same
+# semantics as the other installers of this override and
+# k8s / deb install_apparmor_fusermount3_local_override. Prefer local
+# override over disabling the whole fusermount3 profile. Idempotent;
+# no-op when the stock profile is absent (non-AppArmor hosts).
+install_apparmor_fusermount3_local_override() {
+    local profile="/etc/apparmor.d/fusermount3"
+    local local_override="/etc/apparmor.d/local/fusermount3"
+    # Marker must stay byte-identical in every installer that writes this
+    # override (packages, Kubernetes installer, host-side installers) so
+    # the paths never drift.
+    local marker='/var/lib/sysboxfs/**/,'
+
+    if [ ! -f "${profile}" ]; then
+        return 0
+    fi
+
+    if ! grep -qF "${marker}" "${local_override}" 2>/dev/null; then
+        mkdir -p /etc/apparmor.d/local
+        cat >>"${local_override}" <<'SYSBOX_APPARMOR_LOCAL_FUSERMOUNT3'
+# Local addition (/etc/apparmor.d/local/fusermount3):
+# sysbox-fs mounts its per-container FUSE filesystem under
+# /var/lib/sysboxfs/<container-id>/, which the stock Ubuntu fusermount3
+# profile's whitelist does not cover (HOME, /mnt, /media, /tmp,
+# /run/user/<uid>, /cvmfs only). Without this, every sysbox container create
+# fails at "pre-register with sysbox-fs" with an AppArmor DENIED
+# (operation=mount, profile=fusermount3, info="failed mntpnt match") in dmesg.
+mount fstype=@{fuse_types} options=(nosuid,nodev) options in (ro,rw,noatime,dirsync,nodiratime,noexec,sync) -> /var/lib/sysboxfs/**/,
+umount /var/lib/sysboxfs/**/,
+SYSBOX_APPARMOR_LOCAL_FUSERMOUNT3
+    fi
+
+    apparmor_parser -r /etc/apparmor.d/fusermount3 2>/dev/null || true
+}
+
 is_wsl() {
     case "$(uname -r)" in
     *microsoft*) true ;;
@@ -257,6 +293,10 @@ check_kernel_headers() {
 
 config_sysbox() {
     create_sysboxfs_mountpoint
+
+    # Whitelist sysbox-fs FUSE mounts in the stock fusermount3 AppArmor
+    # profile before sysbox services start (raw rpm -i path).
+    install_apparmor_fusermount3_local_override
 
     if is_wsl; then
         echo "WSL2 detected, enable_unprivileged_userns skipped."
