@@ -67,6 +67,12 @@ COPY --from=sysbox-pkg /extract/usr/bin/sysbox-mgr  /opt/sysbox/bin/generic/sysb
 COPY --from=sysbox-pkg /extract/usr/bin/sysbox-fs   /opt/sysbox/bin/generic/sysbox-fs
 COPY --from=sysbox-pkg /extract/usr/bin/sysbox-runc /opt/sysbox/bin/generic/sysbox-runc
 
+# Ship our packaged systemd units (Restart=always etc.) — deploy script copies
+# these onto the node from /opt/sysbox/systemd (not from the .deb directly).
+COPY --from=sysbox-pkg /extract/lib/systemd/system/sysbox-fs.service  /opt/sysbox/systemd/sysbox-fs.service
+COPY --from=sysbox-pkg /extract/lib/systemd/system/sysbox-mgr.service /opt/sysbox/systemd/sysbox-mgr.service
+COPY --from=sysbox-pkg /extract/lib/systemd/system/sysbox.service     /opt/sysbox/systemd/sysbox.service
+
 # Keep the exact package byte-identical for provenance / debugging.
 COPY --from=sysbox-pkg /out/packages/ /opt/sysbox/packages/
 
