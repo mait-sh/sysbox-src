@@ -55,6 +55,16 @@ host_run="/mnt/host/run"
 host_var_lib="/mnt/host/var/lib"
 host_var_lib_sysbox_deploy_k8s="${host_var_lib}/sysbox-deploy-k8s"
 
+# k3s (both standalone "k3s" and split-role "k3s-agent") embeds its own containerd
+# with a config file OUTSIDE the standard /etc/containerd path above, and k3s
+# regenerates that config.toml from scratch on every (re)start UNLESS a sibling
+# config.toml.tmpl exists, in which case it uses that file as the template instead.
+# select_containerd_conf_file_for_runtime() below redirects host_containerd_conf_file
+# to this directory's .tmpl once $k8s_runtime is known, so that both reading and
+# (via config_containerd_for_sysbox) writing target the file containerd actually
+# uses on a k3s node, and so the change survives a k3s restart.
+host_k3s_containerd_conf_dir="${host_var_lib}/rancher/k3s/agent/etc/containerd"
+
 #
 # Subid default values.
 #
@@ -273,17 +283,20 @@ function restart_crio() {
 function get_artifacts_dir() {
 
 	local distro=$os_distro_release
+	local artifacts_dir=""
 
-	if [[ "$distro" == "ubuntu-24.04" ]] ||
-		[[ "$distro" == "ubuntu-22.04" ]] ||
-		[[ "$distro" == "ubuntu-21.10" ]] ||
-		[[ "$distro" == "ubuntu-20.04" ]] ||
-		[[ "$distro" == "ubuntu-18.04" ]] ||
+	# Ubuntu/Debian (including ≥25.04 / 26.04) share the generic binaries we
+	# ship under /opt/sysbox/bin/generic (extracted from the .deb in the image).
+	if [[ "$distro" =~ ^ubuntu- ]] ||
 		[[ "$distro" =~ "debian" ]]; then
 		artifacts_dir="${sysbox_artifacts}/bin/generic"
 	elif [[ "$distro" =~ "flatcar" ]]; then
 		local release=$(echo $distro | cut -d"-" -f2)
 		artifacts_dir="${sysbox_artifacts}/bin/flatcar-${release}"
+	fi
+
+	if [[ -z "$artifacts_dir" ]]; then
+		die "No Sysbox artifacts dir for distro '$distro' (expected ubuntu-*/debian*/flatcar-*)."
 	fi
 
 	echo $artifacts_dir
@@ -671,6 +684,87 @@ function unconfig_crio_for_sysbox() {
 # Containerd Configuration Functions
 #
 
+# Redirects host_containerd_conf_file (and its backup path) to k3s's own embedded
+# containerd config when $k8s_runtime is "k3s" or "k3s-agent", instead of the
+# standard /etc/containerd/config.toml that a k3s node's containerd never reads.
+# Must run once $k8s_runtime is known and before config_containerd_for_sysbox /
+# unconfig_containerd_for_sysbox are called.
+function select_containerd_conf_file_for_runtime() {
+	if [[ "$k8s_runtime" != "k3s" ]] && [[ "$k8s_runtime" != "k3s-agent" ]]; then
+		return
+	fi
+
+	host_containerd_conf_file="${host_k3s_containerd_conf_dir}/config.toml.tmpl"
+	host_containerd_conf_file_backup="${host_containerd_conf_file}.orig"
+
+	# k3s only honors config.toml.tmpl if one exists; absent that, it regenerates
+	# config.toml from scratch on every (re)start and any direct edit to config.toml
+	# itself is silently lost. Seed the .tmpl from k3s's own current config.toml (the
+	# file it actually produced for this node) the first time, so we extend what k3s
+	# already generated rather than replacing it; config_containerd_for_sysbox then
+	# layers the sysbox-runc runtime stanza on top of this file, same as it would for
+	# a standard containerd install.
+	if [ ! -f "${host_containerd_conf_file}" ]; then
+		if [ ! -f "${host_k3s_containerd_conf_dir}/config.toml" ]; then
+			die "k3s containerd config not found at ${host_k3s_containerd_conf_dir}/config.toml; is k3s running on this node?"
+		fi
+		cp "${host_k3s_containerd_conf_dir}/config.toml" "${host_containerd_conf_file}"
+	fi
+}
+
+# containerd 2.0 renamed its CRI plugin id from "io.containerd.grpc.v1.cri" (1.x)
+# to "io.containerd.cri.v1.runtime" (2.x). config_containerd_for_sysbox is only
+# ever invoked for containerd >= 2.0.0 (see is_containerd_with_userns's version
+# gate, the sole caller), so the OLD id below is never actually correct for a
+# real invocation of this function — dasel still happily creates a new, unused
+# table under it, so the write silently no-ops as far as containerd is
+# concerned. Detect the id actually in use from the target config's own
+# built-in "runc" entry (present in every containerd config, rendered or not)
+# instead of hardcoding one, so this keeps working across future plugin-id
+# renames and against any config that already differs from the stock default.
+function containerd_cri_plugin_id() {
+	local conf_file=$1
+	local id
+	# Nested TOML table headers are commonly indented by pretty-printers
+	# (containerd's own generated config.toml indents them, e.g.
+	# "        [plugins.\"...\".containerd.runtimes.runc]") — allow, but do not
+	# require, leading whitespace before the "[".
+	id=$(grep -oP '(?<=^\s{0,16}\[plugins\.)"[^"]*"(?=\.containerd\.runtimes\.runc\])' "${conf_file}" 2>/dev/null | head -1 | tr -d '"')
+	if [ -z "$id" ]; then
+		id=$(grep -oP "(?<=^\s{0,16}\[plugins\.)'[^']*'(?=\.containerd\.runtimes\.runc\])" "${conf_file}" 2>/dev/null | head -1 | tr -d "'")
+	fi
+	echo "${id:-io.containerd.grpc.v1.cri}"
+}
+
+# Escapes literal dots for use as one dasel -p toml path component (dasel's own
+# path separator is also a dot, so a dot that is part of the component's own
+# name, e.g. "io.containerd.cri.v1.runtime", must be backslash-escaped).
+function dasel_escape_path_component() {
+	printf '%s' "$1" | sed 's/\./\\./g'
+}
+
+# Restarts whichever service actually owns the containerd instance sysbox was just
+# configured into: k3s/k3s-agent embed their own containerd and have no standalone
+# "containerd" unit, so restarting that unit on a k3s node either fails or restarts
+# an unrelated (or nonexistent) service while leaving k3s's embedded containerd on
+# its stale, unregenerated config.
+function restart_containerd_for_sysbox() {
+	case "$k8s_runtime" in
+	k3s-agent)
+		echo "Restarting k3s-agent to apply containerd changes ..."
+		systemctl restart k3s-agent
+		;;
+	k3s)
+		echo "Restarting k3s to apply containerd changes ..."
+		systemctl restart k3s
+		;;
+	*)
+		echo "Restarting containerd to apply changes ..."
+		systemctl restart containerd
+		;;
+	esac
+}
+
 function config_containerd_for_sysbox() {
 	echo "Adding Sysbox to containerd config ..."
 
@@ -691,24 +785,26 @@ function config_containerd_for_sysbox() {
 	else
 		echo "Configuring sysbox-runc runtime in containerd config ..."
 
+		local cri_plugin_id
+		cri_plugin_id=$(dasel_escape_path_component "$(containerd_cri_plugin_id "${host_containerd_conf_file}")")
+
 		# Set the runtime_type
 		dasel put string -f "${host_containerd_conf_file}" -p toml \
-			-s "plugins.io\.containerd\.grpc\.v1\.cri.containerd.runtimes.sysbox-runc.runtime_type" \
+			-s "plugins.${cri_plugin_id}.containerd.runtimes.sysbox-runc.runtime_type" \
 			-v "io.containerd.runc.v2"
 
 		# Set BinaryName option
 		dasel put string -f "${host_containerd_conf_file}" -p toml \
-			-s "plugins.io\.containerd\.grpc\.v1\.cri.containerd.runtimes.sysbox-runc.options.BinaryName" \
+			-s "plugins.${cri_plugin_id}.containerd.runtimes.sysbox-runc.options.BinaryName" \
 			-v "${sysbox_runc_path}"
 
 		# Set SystemdCgroup option
 		dasel put bool -f "${host_containerd_conf_file}" -p toml \
-			-s "plugins.io\.containerd\.grpc\.v1\.cri.containerd.runtimes.sysbox-runc.options.SystemdCgroup" \
+			-s "plugins.${cri_plugin_id}.containerd.runtimes.sysbox-runc.options.SystemdCgroup" \
 			-v true
 	fi
 
-	echo "Restarting containerd to apply changes ..."
-	systemctl restart containerd
+	restart_containerd_for_sysbox
 }
 
 function unconfig_containerd_for_sysbox() {
@@ -719,12 +815,14 @@ function unconfig_containerd_for_sysbox() {
 		if grep -q "runtimes.sysbox-runc" "${host_containerd_conf_file}"; then
 			echo "Removing sysbox-runc runtime configuration ..."
 
+			local cri_plugin_id
+			cri_plugin_id=$(dasel_escape_path_component "$(containerd_cri_plugin_id "${host_containerd_conf_file}")")
+
 			# Delete the entire sysbox-runc runtime section using dasel
 			dasel delete -f "${host_containerd_conf_file}" -p toml \
-				-s "plugins.io\.containerd\.grpc\.v1\.cri.containerd.runtimes.sysbox-runc"
+				-s "plugins.${cri_plugin_id}.containerd.runtimes.sysbox-runc"
 
-			echo "Restarting containerd to apply changes ..."
-			systemctl restart containerd
+			restart_containerd_for_sysbox
 		else
 			echo "sysbox-runc runtime not found in containerd config"
 		fi
@@ -807,11 +905,8 @@ function is_supported_distro() {
 
 	local distro=$os_distro_release
 
-	if [[ "$distro" == "ubuntu-24.04" ]] ||
-		[[ "$distro" == "ubuntu-22.04" ]] ||
-		[[ "$distro" == "ubuntu-21.10" ]] ||
-		[[ "$distro" == "ubuntu-20.04" ]] ||
-		[[ "$distro" == "ubuntu-18.04" ]] ||
+	# Any Ubuntu release (incl. 25.04 / 26.04) uses the generic artifact dir.
+	if [[ "$distro" =~ ^ubuntu- ]] ||
 		[[ "$distro" =~ "debian" ]] ||
 		[[ "$distro" =~ "flatcar" ]]; then
 		return
@@ -855,10 +950,18 @@ function is_supported_k8s_version() {
 
 	local ver=$k8s_version
 
-	if [[ "$ver" == "v1.32" ]] ||
-		[[ "$ver" == "v1.33" ]] ||
-		[[ "$ver" == "v1.34" ]] ||
-		[[ "$ver" == "v1.35" ]] ; then
+	# Upstream enumerated v1.32..v1.35 here, so every new
+	# Kubernetes minor release was hard-rejected until someone hand-edited
+	# this list -- v1.36 (the current k3s stable channel) crash-loops the
+	# DaemonSet with "Sysbox is not supported on this Kubernetes version".
+	# Reported upstream as nestybox/sysbox#1036 (unacknowledged). Replace the
+	# enumeration with a numeric floor on the minor version so newer releases
+	# are accepted by default; the EOL-rejection block below is unchanged, so
+	# v1.19..v1.31 still fail exactly as before.
+	local -r min_supported_minor=32
+
+	if [[ "$ver" =~ ^v1\.([0-9]+)$ ]] &&
+		((BASH_REMATCH[1] >= min_supported_minor)); then
 		return
 	fi
 
@@ -1288,6 +1391,12 @@ function main() {
 	elif [ "$k8s_runtime" == "cri-o" ]; then
 		k8s_runtime="crio"
 	fi
+
+	# Must run once k8s_runtime is known and before any containerd config read/write
+	# below (config_containerd_for_sysbox / unconfig_containerd_for_sysbox), so both
+	# target k3s's actual embedded-containerd config on a k3s/k3s-agent node instead
+	# of the standard /etc/containerd/config.toml that k3s's containerd never reads.
+	select_containerd_conf_file_for_runtime
 
 	k8s_taints=${SYSBOX_TAINT:-"sysbox-runtime=not-running:NoSchedule"}
 
