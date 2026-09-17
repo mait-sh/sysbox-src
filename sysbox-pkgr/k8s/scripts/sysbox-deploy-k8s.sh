@@ -390,6 +390,50 @@ function stop_sysbox() {
 	fi
 }
 
+# Same fusermount3 AppArmor local-override semantics as the package
+# post-install scripts (install_apparmor_fusermount3_local_override in the
+# deb, rpm and Arch packaging). The stock Ubuntu fusermount3 profile does
+# not whitelist /var/lib/sysboxfs/**, so sysbox-fs FUSE mounts are DENIED.
+# Idempotent; no-op when the stock profile is absent (non-AppArmor hosts).
+function install_apparmor_fusermount3_local_override() {
+	local host_profile="${host_etc}/apparmor.d/fusermount3"
+	local host_local="${host_etc}/apparmor.d/local/fusermount3"
+	# Marker must stay byte-identical in every installer that writes this
+	# override, so the package and Kubernetes paths never drift.
+	local marker='/var/lib/sysboxfs/**/,'
+
+	if [ ! -f "${host_profile}" ]; then
+		echo "Skipping fusermount3 AppArmor local override (stock profile absent on host)."
+		return 0
+	fi
+
+	if grep -qF "${marker}" "${host_local}" 2>/dev/null; then
+		echo "fusermount3 AppArmor local override already present."
+	else
+		echo "Installing fusermount3 AppArmor local override for sysbox-fs mounts ..."
+		mkdir -p "${host_etc}/apparmor.d/local"
+		cat >>"${host_local}" <<'SYSBOX_APPARMOR_LOCAL_FUSERMOUNT3'
+# Local addition (/etc/apparmor.d/local/fusermount3):
+# sysbox-fs mounts its per-container FUSE filesystem under
+# /var/lib/sysboxfs/<container-id>/, which the stock Ubuntu fusermount3
+# profile's whitelist does not cover (HOME, /mnt, /media, /tmp,
+# /run/user/<uid>, /cvmfs only). Without this, every sysbox container create
+# fails at "pre-register with sysbox-fs" with an AppArmor DENIED
+# (operation=mount, profile=fusermount3, info="failed mntpnt match") in dmesg.
+mount fstype=@{fuse_types} options=(nosuid,nodev) options in (ro,rw,noatime,dirsync,nodiratime,noexec,sync) -> /var/lib/sysboxfs/**/,
+umount /var/lib/sysboxfs/**/,
+SYSBOX_APPARMOR_LOCAL_FUSERMOUNT3
+	fi
+
+	# Reload on the *host* so #include <local/fusermount3> resolves against
+	# host /etc/apparmor.d (the container's tree is empty / unrelated).
+	if command -v nsenter >/dev/null 2>&1; then
+		nsenter -t 1 -m -u -i -n -- apparmor_parser -r /etc/apparmor.d/fusermount3 2>/dev/null || true
+	else
+		echo "WARNING: nsenter unavailable; wrote AppArmor override but could not reload profile."
+	fi
+}
+
 function install_sysbox() {
 	# Sysbox could potentially be already installed (during upgrades),
 	# so stop it first to ensure that copy instructions below can
@@ -403,6 +447,8 @@ function install_sysbox() {
 	config_sysbox
 	copy_sysbox_config_to_host
 	copy_sysbox_to_host
+	# AppArmor before start_sysbox so sysbox-fs's first FUSE mount is allowed.
+	install_apparmor_fusermount3_local_override
 	start_sysbox
 }
 
