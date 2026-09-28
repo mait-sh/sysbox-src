@@ -1,5 +1,5 @@
 module main
 
-go 1.13
+go 1.25.0
 
-require golang.org/x/sys v0.0.0-20210906170528-6f6e22806c34
+require golang.org/x/sys v0.47.0

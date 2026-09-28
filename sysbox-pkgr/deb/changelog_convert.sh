@@ -131,9 +131,20 @@ function main() {
     fi
     local versionTag=$(cat ${version_file})
 
+    # Sections whose heading carries no bracketed version (for example a
+    # "## Fork builds" section listing changes carried on top of a release)
+    # are not Debian changelog entries: skip the heading and its items.
+    local skipSection=false
+
     # Iterate though CHANGELOG.md file to extract relevant information.
     while IFS= read -r line; do
+        if echo "${line}" | egrep -q "^## " && ! echo "${line}" | egrep -q "^## \["; then
+            skipSection=true
+            continue
+        fi
+
         if echo ${line} | egrep -q "^## "; then
+            skipSection=false
 
             local currTag=$(echo ${line} | cut -d"[" -f2 | cut -d"]" -f1)
 
@@ -157,7 +168,7 @@ function main() {
             prevTag=${currTag}
             prevUnreleased=${unreleased}
 
-        elif echo "${line}" | egrep -q "^[[:space:]]*\* "; then
+        elif [[ ${skipSection} = false ]] && echo "${line}" | egrep -q "^[[:space:]]*\* "; then
             echo -e "${line}"
         fi
 

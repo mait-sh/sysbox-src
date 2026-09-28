@@ -150,7 +150,7 @@ func (p *program) appendDevice(dev *devices.Rule) error {
 	}
 	p.insts = append(p.insts, acceptBlock(dev.Allow)...)
 	// set blockSym to the first instruction we added in this iteration
-	p.insts[prevBlockLastIdx+1] = p.insts[prevBlockLastIdx+1].Sym(blockSym)
+	p.insts[prevBlockLastIdx+1] = p.insts[prevBlockLastIdx+1].WithSymbol(blockSym)
 	p.blockID++
 	return nil
 }
@@ -163,7 +163,7 @@ func (p *program) finalize() (asm.Instructions, error) {
 	blockSym := "block-" + strconv.Itoa(p.blockID)
 	p.insts = append(p.insts,
 		// R0 <- 0
-		asm.Mov.Imm32(asm.R0, 0).Sym(blockSym),
+		asm.Mov.Imm32(asm.R0, 0).WithSymbol(blockSym),
 		asm.Return(),
 	)
 	p.blockID = -1

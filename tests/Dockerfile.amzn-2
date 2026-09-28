@@ -98,8 +98,8 @@ RUN yum update -y && yum install -y \
 #     aarch64-linux-gnu-binutils
 
 # Install Golang
-RUN wget https://go.dev/dl/go1.24.9.linux-${sys_arch}.tar.gz && \
-    tar -C /usr/local -xzf go1.24.9.linux-${sys_arch}.tar.gz && \
+RUN wget https://go.dev/dl/go1.25.14.linux-${sys_arch}.tar.gz && \
+    tar -C /usr/local -xzf go1.25.14.linux-${sys_arch}.tar.gz && \
     /usr/local/go/bin/go env -w GONOSUMDB=/root/nestybox
 
 ENV GOPATH=/go
@@ -128,7 +128,8 @@ RUN if [ "$sys_arch" = "amd64" ] ; then arch_str="x86_64"; \
     && unzip protoc-3.15.8-linux-${arch_str}.zip -d $HOME/.local \
     && export PATH="$PATH:$HOME/.local/bin" \
      && ln -s $HOME/.local/bin/protoc /usr/local/bin/protoc \
-    && go install github.com/golang/protobuf/protoc-gen-go@latest \
+    && go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.10 \
+    && go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1 \
     && export PATH="$PATH:$(go env GOPATH)/bin"
 
 # Install Kubectl for K8s integration-testing. Notice that we are explicitly
