@@ -1,3 +1,157 @@
+## About this repository
+
+This repository holds a modified version of
+[Sysbox](https://github.com/nestybox/sysbox), the container runtime developed
+by Nestybox, Inc., now part of Docker, Inc. It is the complete source of a set
+of Sysbox packages (`.deb`, `.rpm` and Arch Linux) and of a
+`sysbox-deploy-k8s` image built from them. It is not affiliated with or
+endorsed by Nestybox or Docker.
+
+### Layout
+
+Upstream Sysbox keeps its components in separate repositories that it links
+as Git submodules. Here they are ordinary directories, so one checkout holds
+the complete source of a package:
+
+| Directory | Based on |
+|---|---|
+| `.` | [nestybox/sysbox](https://github.com/nestybox/sysbox) |
+| `sysbox-fs/` | [nestybox/sysbox-fs](https://github.com/nestybox/sysbox-fs) |
+| `sysbox-fs/bazil/` | [nestybox/fuse](https://github.com/nestybox/fuse) |
+| `sysbox-runc/` | [nestybox/sysbox-runc](https://github.com/nestybox/sysbox-runc) |
+| `sysbox-mgr/` | [nestybox/sysbox-mgr](https://github.com/nestybox/sysbox-mgr) |
+| `sysbox-ipc/` | [nestybox/sysbox-ipc](https://github.com/nestybox/sysbox-ipc) |
+| `sysbox-libs/` | [nestybox/sysbox-libs](https://github.com/nestybox/sysbox-libs) |
+| `sysbox-pkgr/` | [nestybox/sysbox-pkgr](https://github.com/nestybox/sysbox-pkgr) |
+| `sysbox-dockerfiles/` | [nestybox/dockerfiles](https://github.com/nestybox/dockerfiles) |
+
+The upstream CI workflows (`.github/`) and the submodule definitions are left
+out, and `CHANGELOG.md` and the `README.md` files are kept as upstream.
+
+### History
+
+- "Import Sysbox from upstream", "Update to upstream Sysbox v0.7.1" and
+  "Update components to newer upstream commits" contain unmodified upstream
+  sources; their messages list the upstream commit of every directory.
+- Up to `v0.7.1-fork.gacd77c9`, every other commit is one complete change
+  carried in the packages, with a description of the problem, the change and
+  its effect. Changes backported from upstream keep their upstream author and
+  name the upstream commits.
+- After that, each new build is one "Update to Sysbox <version> build
+  .g<commit>" commit, whose message lists the upstream directories that moved
+  and the changes of that build, followed by a README commit.
+
+### Release tags
+
+Each tag holds the exact source of one package build: the upstream sources
+that build was based on, plus the changes it carried, with the build
+parameters below set to generic defaults. A package version
+`<version>+<build>.g<commit>` was built from the tag
+`v<version>-fork.g<commit>`. For example, a `0.7.1` package whose version ends
+in `.gacd77c9` was built from `v0.7.1-fork.gacd77c9`.
+
+The tags up to `v0.7.1-fork.gacd77c9` each have their own line of change
+commits on top of the shared upstream imports, so `git log <tag>` lists
+exactly the changes of that build, in their state at that build. `main`
+continues from the newest of them with the changes that are not yet in a
+released package.
+
+From then on `main` only grows. Each new build adds a commit on top of `main`
+whose tree is the source of that build, and that commit carries the build's
+tag; a second commit adds the tag to this README. Tags never move and `main`
+is never rewritten.
+
+| Tag | Sysbox version | Package version ends in | Built |
+|---|---|---|---|
+| `v0.7.0-fork.ga857ef7` | `0.7.0` | `.ga857ef7` | 2026-06-25 |
+| `v0.7.0-fork.g1683137` | `0.7.0` | `.g1683137` | 2026-07-11 |
+| `v0.7.0-fork.g1189f65` | `0.7.0` | `.g1189f65` | 2026-07-28 |
+| `v0.7.0-fork.g72f0890` | `0.7.0` | `.g72f0890` | 2026-08-09 |
+| `v0.7.1-fork.ge98ec28` | `0.7.1` | `.ge98ec28` | 2026-08-14 |
+| `v0.7.1-fork.g9662b7c` | `0.7.1` | `.g9662b7c` | 2026-08-19 |
+| `v0.7.1-fork.g0f0356e` | `0.7.1` | `.g0f0356e` | 2026-08-20 |
+| `v0.7.1-fork.g4473777` | `0.7.1` | `.g4473777` | 2026-09-11 |
+| `v0.7.1-fork.g0b45495` | `0.7.1` | `.g0b45495` | 2026-09-11 |
+| `v0.7.1-fork.gd2bb493` | `0.7.1` | `.gd2bb493` | 2026-09-11 |
+| `v0.7.1-fork.g3e5e35d` | `0.7.1` | `.g3e5e35d` | 2026-09-14 |
+| `v0.7.1-fork.g767ee60` | `0.7.1` | `.g767ee60` | 2026-09-17 |
+| `v0.7.1-fork.gacd77c9` | `0.7.1` | `.gacd77c9` | 2026-09-22 |
+
+The two `0.7.1` builds `.ge98ec28` and `.g9662b7c` have the same source, so
+their tags point to the same commit.
+
+### Build parameters
+
+The names that identify a distributor are generic defaults in this source. A
+distributor sets its own registry, annotation and package names at build and
+deployment time:
+
+| Parameter | Generic default | Where |
+|---|---|---|
+| Registry and tag of the Kubernetes installer image | `sysbox-deploy-k8s:stable`, no registry | `image:` in `sysbox-k8s-manifests/sysbox-install.yaml` and `sysbox-uninstall.yaml` |
+| Key of the manifest-generation annotation | `sysbox-deploy-k8s/manifest-generation` | the DaemonSet in `sysbox-k8s-manifests/sysbox-install.yaml` |
+| Name prefix of the release `.deb` | `sysbox-deb-linux`, set with the build argument `SYSBOX_DEB_PREFIX` | `sysbox-pkgr/k8s/Dockerfile.sysbox-deploy-k8s-deb` |
+
+The builds behind the tags used their distributor's own values for these
+names, and a distributor-specific name for that Dockerfile. So in these lines,
+in the Dockerfile name and in comments, the published source differs from the
+source that was built. None of them is compiled into a binary or changes what
+a package installs.
+
+### Changes from upstream
+
+The changes carried by the newest build, in the order of the commits:
+
+- Fedora and Arch Linux packaging; Debian package built on Ubuntu 24.04 and
+  for arm64; build images with Go 1.25 and `protoc-gen-go-grpc`; rootless and
+  arm64 rpm builds.
+- `sysbox-mgr`, `sysbox-ipc`, `sysbox-runc`: the upstream device manager for
+  GPU passthrough and the upstream gRPC code generation (backports), and
+  passthrough of `/dev/kvm`, `/dev/dri` and `/dev/dxg`.
+- `sysbox-runc`, `sysbox-mgr`, `sysbox-ipc`, `sysbox-libs`: the upstream
+  ID-mapping of the overlayfs upper layer (backport), and repair of an upper
+  layer left shifted after a host reboot.
+- `sysbox-fs`: bounded nsenter waits, a per-container circuit breaker, a
+  supervised FUSE server and fixes for ENOSYS errors from the seccomp
+  listener.
+- `sysbox-pkgr` and `sysbox-k8s-manifests/`: Kubernetes installer fixes and
+  an installer image built from the packages, `Restart=always` for the
+  daemons, and an AppArmor local override for `fusermount3`.
+
+To see one change, run `git show <commit>`; to see all changes of a build,
+compare its tag with the last upstream commit below it, for example:
+
+```sh
+git log --oneline v0.7.1-fork.gacd77c9
+git diff v0.7.1-fork.gacd77c9~16 v0.7.1-fork.gacd77c9 --stat
+```
+
+### Building the packages
+
+```sh
+git clone <this repository> sysbox-src
+cd sysbox-src
+git checkout v0.7.1-fork.gacd77c9                 # the tag that matches your package
+make -C sysbox-pkgr sysbox-ce-repo "$PWD"
+make -C sysbox-pkgr/deb generic EDITION=ce        # .deb (Ubuntu 24.04 build image)
+make -C sysbox-pkgr/rpm fedora-42 EDITION=ce      # .rpm (Fedora 42 build image)
+make -C sysbox-pkgr/arch arch-current EDITION=ce  # Arch Linux package
+```
+
+The builds run in Docker. From the builds that ship them,
+`sysbox-pkgr/licenses/STATIC-LINKING.md` explains the statically linked LGPL
+libraries and how to relink them.
+
+### Licence
+
+Apache License 2.0, as upstream (see [LICENSE](LICENSE)); the changes in this
+repository are contributed under the same licence. The components keep their
+own licence and notice files, for example `sysbox-runc/NOTICE`,
+`sysbox-fs/bazil/LICENSE` (BSD-style) and `sysbox-dockerfiles/LICENSE.txt`
+(MIT). For questions about this repository, open an issue.
+
+---
+
 <p align="center">
     <img alt="sysbox" src="./docs/figures/sysbox-ce-header.png"/>
 </p>
