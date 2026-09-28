@@ -48,6 +48,22 @@ override_dh_auto_install:
 	install -D -m 0644 /sources/99-sysbox-sysctl.conf \
 		debian/sysbox-ce/lib/sysctl.d/99-sysbox-sysctl.conf
 
+	# Licence texts and notices (see debian/copyright). The binaries are
+	# statically linked, so record the glibc and libseccomp versions used.
+	docdir=debian/sysbox-ce/usr/share/doc/sysbox-ce && \
+	install -D -m 0644 sysbox/LICENSE $$docdir/LICENSE && \
+	install -D -m 0644 sysbox/sysbox-runc/NOTICE $$docdir/NOTICE.sysbox-runc && \
+	install -D -m 0644 sysbox/OSS_DISCLOSURES.md $$docdir/OSS_DISCLOSURES.md && \
+	install -D -m 0644 /sources/LGPL-2.1.txt $$docdir/LGPL-2.1 && \
+	install -D -m 0644 /sources/STATIC-LINKING.md $$docdir/STATIC-LINKING.md && \
+	dpkg-query -W -f='- $${Package} $${Version} ($${Architecture}), static\n' \
+		libc6-dev libseccomp-dev >> $$docdir/STATIC-LINKING.md
+
+# Keep the licence texts and notices uncompressed so they stay readable.
+override_dh_compress:
+	dh_compress -XLICENSE -XNOTICE.sysbox-runc -XOSS_DISCLOSURES.md \
+		-XLGPL-2.1 -XSTATIC-LINKING.md
+
 override_dh_installinit:
 	# Use "sysbox" as our service name, not "sysbox-ce".
 	dh_installinit --name=sysbox

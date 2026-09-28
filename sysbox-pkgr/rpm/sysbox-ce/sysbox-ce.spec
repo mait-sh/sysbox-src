@@ -60,6 +60,9 @@ Source3:        sysbox-mgr.service
 Source4:        99-sysbox-sysctl.conf
 Source5:        50-sysbox-mod.conf
 Source6:        sysbox-postinstall.sh
+# Licence text and static-linking notice (from ../licenses/).
+Source7:        LGPL-2.1.txt
+Source8:        STATIC-LINKING.md
 
 # ----- Build requirements -----
 # Mirrors the apt deps in deb/ubuntu-jammy/Dockerfile, translated for dnf.
@@ -170,9 +173,17 @@ install -D -m 0644 %{SOURCE5} %{buildroot}%{_sysconfdir}/modules-load.d/50-sysbo
 # from %post without inlining the entire script body.
 install -D -m 0755 %{SOURCE6} %{buildroot}%{_libexecdir}/sysbox/sysbox-postinstall.sh
 
+# Licence texts and notices. The binaries are statically linked, so record
+# the glibc and libseccomp versions used.
+install -m 0644 %{SOURCE7} LGPL-2.1
+install -m 0644 %{SOURCE8} STATIC-LINKING.md
+install -m 0644 sysbox/sysbox-runc/NOTICE NOTICE.sysbox-runc
+rpm -q --qf '- %%{NAME} %%{VERSION}-%%{RELEASE} (%%{ARCH}), static\n' \
+    glibc-static libseccomp-static >> STATIC-LINKING.md
+
 %files
-%license sysbox/LICENSE
-%doc sysbox/README.md
+%license sysbox/LICENSE LGPL-2.1 NOTICE.sysbox-runc
+%doc sysbox/README.md sysbox/OSS_DISCLOSURES.md STATIC-LINKING.md
 %{_bindir}/sysbox-fs
 %{_bindir}/sysbox-mgr
 %{_bindir}/sysbox-runc

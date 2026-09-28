@@ -1,12 +1,70 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: Nestybox Sysbox
-Upstream-Contact: Nestybox Inc <contact@nestybox.com>
-
-Disclaimer:
- This package is not part of the GNU/Linux Debian distribution.
- No modifications of the included binaries, and no other uses or
- further distributions of the included binaries, are permitted.
+Upstream-Name: Sysbox
+Upstream-Contact: https://github.com/nestybox/sysbox/issues
+Source: https://github.com/mait-sh/sysbox-src
+Comment:
+ This package contains a modified version of Sysbox Community Edition.
+ Sysbox is developed by Nestybox, Inc., now part of Docker, Inc.:
+ https://github.com/nestybox/sysbox
+ .
+ Modified by the Sysbox fork maintainers. The modified source of this build
+ is published at https://github.com/mait-sh/sysbox-src; the "About this
+ repository" section of its README describes the changes. A package version
+ <version>+<build>.g<commit> was built from the tag v<version>-fork.g<commit>
+ of that repository. The changes are licensed under the Apache License,
+ Version 2.0, like the rest of Sysbox.
+ .
+ The sysbox-fs, sysbox-mgr and sysbox-runc binaries are statically linked
+ with the GNU C Library (LGPL-2.1-or-later), and sysbox-fs and sysbox-runc
+ also with libseccomp (LGPL-2.1-only). STATIC-LINKING.md in this directory
+ gives the library versions, where to get their source and how to relink.
+ The Go modules compiled into the binaries and their licences are listed in
+ OSS_DISCLOSURES.md in this directory.
+ .
+ This package is not part of the Debian or Ubuntu distributions.
 
 Files: *
-Copyright: 2019-2022 Nestybox Inc.  All rights reserved.
-License: Apache License, Version 2.0.
+Copyright: 2019-2026 Nestybox, Inc. (now part of Docker, Inc.) and the Sysbox authors
+           2026 The Sysbox fork maintainers
+License: Apache-2.0
+
+Files: sysbox-runc/*
+Copyright: 2012-2015 Docker, Inc.
+           The runc and libcontainer authors
+           2019-2026 Nestybox, Inc. (now part of Docker, Inc.) and the Sysbox authors
+           2026 The Sysbox fork maintainers
+License: Apache-2.0
+Comment: sysbox-runc is derived from runc (https://github.com/opencontainers/runc).
+ Its NOTICE file is installed as NOTICE.sysbox-runc in this directory.
+
+License: Apache-2.0
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+ .
+ https://www.apache.org/licenses/LICENSE-2.0
+ .
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ .
+ On Debian and Ubuntu systems, the complete text of the Apache License,
+ Version 2.0 is in /usr/share/common-licenses/Apache-2.0. It is also installed
+ as LICENSE in this directory.
+
+License: LGPL-2.1
+ The GNU C Library and libseccomp are free software; you can redistribute
+ them and/or modify them under the terms of the GNU Lesser General Public
+ License version 2.1 as published by the Free Software Foundation (for the
+ GNU C Library, at your option any later version).
+ .
+ They are distributed in the hope that they will be useful, but WITHOUT ANY
+ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more
+ details.
+ .
+ The complete text of the GNU Lesser General Public License, version 2.1 is
+ installed as LGPL-2.1 in this directory. On Debian and Ubuntu systems it is
+ also in /usr/share/common-licenses/LGPL-2.1.

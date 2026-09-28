@@ -73,6 +73,10 @@ COPY --from=sysbox-pkg /extract/lib/systemd/system/sysbox-fs.service  /opt/sysbo
 COPY --from=sysbox-pkg /extract/lib/systemd/system/sysbox-mgr.service /opt/sysbox/systemd/sysbox-mgr.service
 COPY --from=sysbox-pkg /extract/lib/systemd/system/sysbox.service     /opt/sysbox/systemd/sysbox.service
 
+# Licence texts and notices from the package (copyright, LGPL-2.1,
+# STATIC-LINKING.md, NOTICE.sysbox-runc, OSS_DISCLOSURES.md).
+COPY --from=sysbox-pkg /extract/usr/share/doc/sysbox-ce/ /opt/sysbox/share/doc/sysbox-ce/
+
 # Keep the exact package byte-identical for provenance / debugging.
 COPY --from=sysbox-pkg /out/packages/ /opt/sysbox/packages/
 

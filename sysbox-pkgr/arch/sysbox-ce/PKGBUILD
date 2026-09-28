@@ -69,11 +69,15 @@ source=(
     '99-sysbox-sysctl.conf'
     '50-sysbox-mod.conf'
     'sysbox-postinstall.sh'
+    'LGPL-2.1.txt'
+    'STATIC-LINKING.md'
 )
 # `SKIP` is intentional — sysbox.tgz is regenerated per build by the
 # orchestrator; the source-of-truth digest is the upstream git ref pinned
 # downstream, not a tarball hash.
 sha256sums=(
+    'SKIP'
+    'SKIP'
     'SKIP'
     'SKIP'
     'SKIP'
@@ -146,7 +150,16 @@ package() {
     install -D -m 0755 sysbox-postinstall.sh \
         "${pkgdir}/usr/lib/sysbox/sysbox-postinstall.sh"
 
-    # License (sysbox is Apache-2.0).
-    install -D -m 0644 sysbox/LICENSE \
-        "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    # License (sysbox is Apache-2.0) and notices.
+    local licdir="${pkgdir}/usr/share/licenses/${pkgname}"
+    install -D -m 0644 sysbox/LICENSE "${licdir}/LICENSE"
+    install -D -m 0644 sysbox/sysbox-runc/NOTICE "${licdir}/NOTICE.sysbox-runc"
+    install -D -m 0644 sysbox/OSS_DISCLOSURES.md "${licdir}/OSS_DISCLOSURES.md"
+    install -D -m 0644 LGPL-2.1.txt "${licdir}/LGPL-2.1"
+
+    # This package links glibc and libseccomp dynamically (see build());
+    # record the versions it was built against.
+    install -D -m 0644 STATIC-LINKING.md "${licdir}/STATIC-LINKING.md"
+    pacman -Q glibc libseccomp | sed 's/^/- /; s/$/, dynamic (not included in this package)/' \
+        >> "${licdir}/STATIC-LINKING.md"
 }

@@ -43,7 +43,9 @@ SOURCE_FILES =  sysbox.tgz           \
 		sysbox-fs.service    \
 		sysbox-mgr.service   \
 		99-sysbox-sysctl.conf \
-		50-sysbox-mod.conf
+		50-sysbox-mod.conf  \
+		LGPL-2.1.txt         \
+		STATIC-LINKING.md
 
 SOURCES=$(addprefix sources/, $(SOURCE_FILES))
 
@@ -116,5 +118,14 @@ sources/99-sysbox-sysctl.conf: ../systemd/99-sysbox-sysctl.conf
 	cp $< $@
 
 sources/50-sysbox-mod.conf: ../systemd/50-sysbox-mod.conf
+	mkdir -p $(@D)
+	cp $< $@
+
+# Licence text and static-linking notice shipped in the package docs.
+sources/LGPL-2.1.txt: ../licenses/LGPL-2.1.txt
+	mkdir -p $(@D)
+	cp $< $@
+
+sources/STATIC-LINKING.md: ../licenses/STATIC-LINKING.md
 	mkdir -p $(@D)
 	cp $< $@
